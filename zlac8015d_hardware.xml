@@ -1,0 +1,9 @@
+<library path="zlac8015d_hardware">
+  <class name="zlac8015d_hardware/Zlac8015dSystemHardware"
+         type="zlac8015d_hardware::Zlac8015dSystemHardware"
+         base_class_type="hardware_interface::SystemInterface">
+    <description>
+      CANopen Hardware Interface for ZLAC8015D Motor Driver.
+    </description>
+  </class>
+</library>
