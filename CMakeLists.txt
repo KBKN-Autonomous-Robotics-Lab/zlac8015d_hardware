@@ -36,6 +36,14 @@ add_executable(b0_identification
 )
 target_compile_features(b0_identification PUBLIC cxx_std_17)
 
+
+# Standalone LADRC step-response validation tool. It talks directly to
+# SocketCAN so ros2_control cannot overwrite the test current.
+add_executable(ladrc_step_response
+  src/ladrc_step_response.cpp
+)
+target_compile_features(ladrc_step_response PUBLIC cxx_std_17)
+
 pluginlib_export_plugin_description_file(hardware_interface zlac8015d_hardware.xml)
 
 install(
@@ -44,13 +52,14 @@ install(
 )
 
 install(
-  TARGETS b0_identification
+  TARGETS b0_identification ladrc_step_response
   DESTINATION lib/${PROJECT_NAME}
 )
 
 install(
   PROGRAMS
     scripts/analyze_b0.py
+    scripts/analyze_ladrc_step.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
