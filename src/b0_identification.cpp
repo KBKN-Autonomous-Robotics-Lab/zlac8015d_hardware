@@ -42,15 +42,22 @@ struct Options
 {
   std::string can_interface{"can0"};
   int node_id{1};
-  std::vector<double> currents_a{1.0, 1.5, 2.0, 2.5, 3.0};
-  int repeats{5};
-  double pulse_s{0.30};
-  double settle_s{1.00};
+  std::vector<double> currents_a{0.5, 1.0, 1.5};
+  int repeats{3};
+  double pulse_s{0.20};
   double sample_hz{200.0};
-  double max_current_a{3.0};
+  double max_current_a{1.5};
+
+  // A trial starts only after BOTH wheels remain below stop_threshold_rad_s
+  // continuously for stop_hold_s.  If this does not happen before
+  // stop_timeout_s, that trial is skipped without applying current.
+  double stop_threshold_rad_s{0.15};
+  double stop_hold_s{0.50};
+  double stop_timeout_s{15.0};
+
   bool bidirectional{false};
   bool run{false};
-  std::string output{"b0_identification.csv"};
+  std::string output{"b0_identification_v4.csv"};
 };
 
 struct Feedback
@@ -106,19 +113,24 @@ void print_usage(const char * argv0)
   std::cout
     << "Usage: " << argv0 << " --run [options]\n\n"
     << "WARNING: this program commands motor current and moves the robot.\n"
-    << "Lift/test safely first, then use a clear straight test lane.\n\n"
+    << "Use a safe test setup with a clear emergency-stop path.\n\n"
+    << "Identification sequence:\n"
+    << "  zero current -> wait until both wheels are stopped -> short pulse -> zero current\n"
+    << "  With --bidirectional, +I/-I are interleaved to improve identifiability.\n\n"
     << "Options:\n"
-    << "  --can can0                 SocketCAN interface (default can0)\n"
-    << "  --node 1                   CANopen node ID (default 1)\n"
-    << "  --currents 1,1.5,2,2.5,3  Test current magnitudes in A\n"
-    << "  --repeats 5                Repetitions per current (default 5)\n"
-    << "  --pulse 0.30               Current-pulse duration in s\n"
-    << "  --settle 1.00              Zero-current settling time in s\n"
-    << "  --sample-hz 200            Logging/command loop frequency\n"
-    << "  --max-current 3.0          Hard software safety limit in A\n"
-    << "  --bidirectional            Also test negative current commands\n"
-    << "  --output FILE.csv          Output CSV path\n"
-    << "  --run                      Required to enable motor commands\n";
+    << "  --can can0                   SocketCAN interface (default can0)\n"
+    << "  --node 1                     CANopen node ID (default 1)\n"
+    << "  --currents 0.5,1.0,1.5      Positive current magnitudes in A\n"
+    << "  --repeats 3                  Repetitions of the full current set\n"
+    << "  --pulse 0.20                 Current-pulse duration in s\n"
+    << "  --sample-hz 200              Feedback/logging frequency\n"
+    << "  --max-current 1.5            Hard software safety limit in A\n"
+    << "  --stop-threshold 0.15        Required |wheel speed| in rad/s\n"
+    << "  --stop-hold 0.50             Required continuous stopped time in s\n"
+    << "  --stop-timeout 15.0          Skip trial if stop is not reached in s\n"
+    << "  --bidirectional              Interleave positive and negative pulses\n"
+    << "  --output FILE.csv            Output CSV path\n"
+    << "  --run                        Required to enable motor commands\n";
 }
 
 Options parse_options(int argc, char ** argv)
@@ -143,18 +155,28 @@ Options parse_options(int argc, char ** argv)
       opt.repeats = std::stoi(require_value(arg));
     } else if (arg == "--pulse") {
       opt.pulse_s = std::stod(require_value(arg));
-    } else if (arg == "--settle") {
-      opt.settle_s = std::stod(require_value(arg));
     } else if (arg == "--sample-hz") {
       opt.sample_hz = std::stod(require_value(arg));
     } else if (arg == "--max-current") {
       opt.max_current_a = std::stod(require_value(arg));
+    } else if (arg == "--stop-threshold") {
+      opt.stop_threshold_rad_s = std::stod(require_value(arg));
+    } else if (arg == "--stop-hold") {
+      opt.stop_hold_s = std::stod(require_value(arg));
+    } else if (arg == "--stop-timeout") {
+      opt.stop_timeout_s = std::stod(require_value(arg));
     } else if (arg == "--output") {
       opt.output = require_value(arg);
     } else if (arg == "--bidirectional") {
       opt.bidirectional = true;
     } else if (arg == "--run") {
       opt.run = true;
+    } else if (arg == "--settle") {
+      // Backward-compatible with v3 command lines.  Fixed settle time is no
+      // longer used; stop detection is based on measured wheel speed.
+      (void)require_value(arg);
+      std::cerr << "NOTE: --settle is ignored in v4; use --stop-threshold, "
+                   "--stop-hold and --stop-timeout instead.\\n";
     } else if (arg == "--help" || arg == "-h") {
       print_usage(argv[0]);
       std::exit(0);
@@ -164,8 +186,9 @@ Options parse_options(int argc, char ** argv)
   }
 
   if (opt.node_id < 1 || opt.node_id > 127 || opt.repeats <= 0 ||
-      opt.pulse_s <= 0.0 || opt.settle_s < 0.0 || opt.sample_hz <= 0.0 ||
-      opt.max_current_a <= 0.0)
+      opt.pulse_s <= 0.0 || opt.sample_hz <= 0.0 ||
+      opt.max_current_a <= 0.0 || opt.stop_threshold_rad_s <= 0.0 ||
+      opt.stop_hold_s <= 0.0 || opt.stop_timeout_s <= opt.stop_hold_s)
   {
     throw std::runtime_error("Invalid numeric option");
   }
@@ -577,6 +600,90 @@ void run_phase(
   }
 }
 
+bool wait_until_stopped(
+  ZlacCan & can,
+  Feedback & fb,
+  std::ofstream & csv,
+  const std::chrono::steady_clock::time_point & program_start,
+  int trial,
+  double sample_hz,
+  double threshold_rad_s,
+  double hold_s,
+  double timeout_s)
+{
+  const auto period = std::chrono::duration<double>(1.0 / sample_hz);
+  can.command_current(0.0);
+
+  const auto phase_start = std::chrono::steady_clock::now();
+  auto next_tick = phase_start;
+  bool below_active = false;
+  std::chrono::steady_clock::time_point below_since{};
+
+  while (g_keep_running.load()) {
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed =
+      std::chrono::duration<double>(now - phase_start).count();
+
+    can.drain_feedback(fb);
+    log_row(csv, program_start, trial, "wait_stop", elapsed, 0.0, fb);
+
+    if (fb.velocity_valid) {
+      const bool below =
+        std::abs(fb.left_velocity) <= threshold_rad_s &&
+        std::abs(fb.right_velocity) <= threshold_rad_s;
+
+      if (below) {
+        if (!below_active) {
+          below_active = true;
+          below_since = now;
+        }
+        const double held =
+          std::chrono::duration<double>(now - below_since).count();
+        if (held >= hold_s) {
+          return true;
+        }
+      } else {
+        below_active = false;
+      }
+    }
+
+    if (elapsed >= timeout_s) {
+      return false;
+    }
+
+    next_tick += std::chrono::duration_cast<std::chrono::steady_clock::duration>(period);
+    std::this_thread::sleep_until(next_tick);
+  }
+  return false;
+}
+
+std::vector<double> build_test_sequence(const Options & opt)
+{
+  std::vector<double> sequence;
+  sequence.reserve(
+    static_cast<size_t>(opt.repeats) * opt.currents_a.size() *
+    (opt.bidirectional ? 2u : 1u));
+
+  for (int repeat = 0; repeat < opt.repeats; ++repeat) {
+    for (double magnitude : opt.currents_a) {
+      if (!opt.bidirectional) {
+        sequence.push_back(magnitude);
+        continue;
+      }
+
+      // Reverse the order every repeat to reduce order/thermal bias.
+      if ((repeat % 2) == 0) {
+        sequence.push_back(+magnitude);
+        sequence.push_back(-magnitude);
+      } else {
+        sequence.push_back(-magnitude);
+        sequence.push_back(+magnitude);
+      }
+    }
+  }
+  return sequence;
+}
+
 }  // namespace
 
 int main(int argc, char ** argv)
@@ -592,12 +699,7 @@ int main(int argc, char ** argv)
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
-    std::vector<double> test_currents = opt.currents_a;
-    if (opt.bidirectional) {
-      for (double current : opt.currents_a) {
-        test_currents.push_back(-current);
-      }
-    }
+    const std::vector<double> test_sequence = build_test_sequence(opt);
 
     std::ofstream csv(opt.output);
     if (!csv) {
@@ -607,15 +709,17 @@ int main(int argc, char ** argv)
         << "left_cmd_A,right_cmd_A,left_actual_A,right_actual_A,"
         << "left_omega_rad_s,right_omega_rad_s,left_position_rad,right_position_rad\n";
 
-    std::cout << "b0 identification will MOVE the robot.\n"
+    std::cout << "b0 identification v4 will MOVE the robot.\n"
               << "CAN=" << opt.can_interface
               << " node=" << opt.node_id
               << " sample=" << opt.sample_hz << " Hz"
               << " pulse=" << opt.pulse_s << " s"
-              << " repeats=" << opt.repeats
+              << " stop_threshold=" << opt.stop_threshold_rad_s << " rad/s"
+              << " stop_hold=" << opt.stop_hold_s << " s"
+              << " stop_timeout=" << opt.stop_timeout_s << " s"
               << " output=" << opt.output << "\n";
-    std::cout << "Currents [A]:";
-    for (double current : test_currents) {
+    std::cout << "Trial sequence [A]:";
+    for (double current : test_sequence) {
       std::cout << ' ' << current;
     }
     std::cout << "\nStarting in 3 seconds. Ctrl-C aborts and commands zero current.\n";
@@ -627,34 +731,59 @@ int main(int argc, char ** argv)
 
     Feedback fb;
     const auto program_start = std::chrono::steady_clock::now();
-    int trial = 0;
 
-    // Initial zero-current phase also gives the TPDOs time to arrive.
-    run_phase(
-      can, fb, csv, program_start, trial, "initial_settle",
-      0.0, std::max(1.0, opt.settle_s), opt.sample_hz);
+    // Wait for initial TPDO reception and an actually stopped state.
+    std::cout << "Initial stop check...\n";
+    if (!wait_until_stopped(
+        can, fb, csv, program_start, 0, opt.sample_hz,
+        opt.stop_threshold_rad_s, opt.stop_hold_s, opt.stop_timeout_s))
+    {
+      throw std::runtime_error(
+        "Initial stop condition was not reached before timeout. "
+        "No identification pulse was applied.");
+    }
 
     if (!fb.velocity_valid || !fb.current_valid) {
       throw std::runtime_error(
         "Velocity/current TPDO feedback was not received. Check PDO mapping and CAN setup.");
     }
 
-    for (double current : test_currents) {
-      for (int repeat = 0; repeat < opt.repeats && g_keep_running.load(); ++repeat) {
-        ++trial;
-        std::cout << "Trial " << trial << ": " << current << " A\n";
+    int trial = 0;
+    int skipped = 0;
 
-        run_phase(
-          can, fb, csv, program_start, trial, "settle",
-          0.0, opt.settle_s, opt.sample_hz);
-
-        run_phase(
-          can, fb, csv, program_start, trial, "pulse",
-          current, opt.pulse_s, opt.sample_hz);
-
-        can.command_current(0.0);
-        csv.flush();
+    for (double current : test_sequence) {
+      if (!g_keep_running.load()) {
+        break;
       }
+      ++trial;
+
+      std::cout << "Trial " << trial << "/" << test_sequence.size()
+                << ": target " << current << " A; waiting for stop...\n";
+
+      const bool stopped = wait_until_stopped(
+        can, fb, csv, program_start, trial, opt.sample_hz,
+        opt.stop_threshold_rad_s, opt.stop_hold_s, opt.stop_timeout_s);
+
+      if (!stopped) {
+        ++skipped;
+        std::cerr << "  SKIP: stop condition not reached within "
+                  << opt.stop_timeout_s << " s"
+                  << " (last omega L=" << fb.left_velocity
+                  << ", R=" << fb.right_velocity << " rad/s).\n";
+        csv.flush();
+        continue;
+      }
+
+      std::cout << "  stopped: omega L=" << fb.left_velocity
+                << ", R=" << fb.right_velocity
+                << " rad/s -> pulse\n";
+
+      run_phase(
+        can, fb, csv, program_start, trial, "pulse",
+        current, opt.pulse_s, opt.sample_hz);
+
+      can.command_current(0.0);
+      csv.flush();
     }
 
     can.command_current(0.0);
@@ -662,7 +791,9 @@ int main(int argc, char ** argv)
     csv.flush();
 
     std::cout << "Finished. CSV written to " << opt.output << "\n"
-              << "Run analyze_b0.py on this CSV to estimate b0_L and b0_R.\n";
+              << "Trials requested=" << trial
+              << ", skipped_for_stop=" << skipped << "\n"
+              << "Run analyze_b0.py on this CSV for the global b0 fit.\n";
     return g_keep_running.load() ? 0 : 130;
   } catch (const std::exception & e) {
     std::cerr << "ERROR: " << e.what() << '\n';
