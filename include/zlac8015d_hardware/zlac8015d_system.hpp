@@ -1,6 +1,7 @@
 #ifndef ZLAC8015D_SYSTEM_HPP_
 #define ZLAC8015D_SYSTEM_HPP_
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -37,18 +38,62 @@ public:
     const rclcpp::Duration & period) override;
 
 private:
-  // CAN socket
-  int can_socket_{-1};
+  struct LadrcState
+  {
+    double z1{0.0};          // estimated wheel speed [rad/s]
+    double z2{0.0};          // estimated total disturbance [rad/s^2]
+    double b0{1.0};          // nominal input gain [(rad/s^2)/A]
+    double last_current_cmd{0.0};
+    bool initialized{false};
+  };
 
-  bool send_can_frame(
-    uint32_t can_id,
-    const std::vector<uint8_t> & data);
+  enum class ControlMode
+  {
+    VELOCITY,
+    LADRC_TORQUE
+  };
+
+  // CAN socket / CANopen configuration
+  int can_socket_{-1};
+  std::string can_interface_{"can0"};
+  uint8_t node_id_{1};
+
+  bool send_can_frame(uint32_t can_id, const std::vector<uint8_t> & data);
+  bool configure_feedback_pdos();
+  bool configure_velocity_rpdo();
+  bool configure_torque_rpdo();
+  void send_zero_command();
+
+  // LADRC helper
+  double compute_ladrc_current(
+    LadrcState & state,
+    double velocity_reference,
+    double velocity_measured,
+    double current_measured,
+    double dt);
+  static double clamp(double value, double lower, double upper);
 
   // ros2_control command / state
   std::vector<double> hw_commands_;    // target wheel velocity [rad/s]
   std::vector<double> hw_positions_;   // encoder-based wheel position [rad]
   std::vector<double> hw_velocities_;  // actual wheel velocity [rad/s]
-  std::vector<double> hw_efforts_;     // actual motor current [A]
+  std::vector<double> hw_efforts_;     // actual motor current [A], ROS-positive forward
+
+  // Controller configuration
+  ControlMode control_mode_{ControlMode::VELOCITY};
+  LadrcState left_ladrc_;
+  LadrcState right_ladrc_;
+  double controller_bandwidth_{5.0};       // wc [rad/s]
+  double observer_bandwidth_{20.0};        // wo [rad/s]
+  double current_limit_a_{2.0};            // absolute LADRC output limit [A]
+  double current_rate_limit_a_per_s_{20.0};
+  double feedback_timeout_s_{0.030};
+
+  // Feedback watchdog
+  bool velocity_feedback_received_{false};
+  bool current_feedback_received_{false};
+  std::chrono::steady_clock::time_point last_velocity_feedback_time_{};
+  bool feedback_timeout_reported_{false};
 
   // 6064h Position actual value [count]
   int32_t raw_position_left_{0};
