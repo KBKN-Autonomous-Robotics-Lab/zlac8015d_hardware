@@ -230,13 +230,20 @@ public:
     configure_feedback_pdos();
     configure_torque_rpdo();
 
-    // Synchronized left/right command update flag.
-    sdo_write_u16(0x200F, 0x00, 1);
+    // Identification uses immediate/asynchronous target-current updates.
+    // This avoids depending on RPDO processing while we validate torque mode.
+    sdo_write_u16(0x200F, 0x00, 0);
 
     nmt(0x01);  // operational
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
     sdo_write_u8(0x6060, 0x00, 4);  // Profile Torque Mode
+
+    // Make the torque/current ramp fast enough for a short identification pulse.
+    // ZLAC8015D 6087h:01/:02 are torque slopes in mA/s.
+    sdo_write_u32(0x6087, 0x01, 20000);
+    sdo_write_u32(0x6087, 0x02, 20000);
+
     command_current(0.0);
 
     // CiA402 servo on: shutdown -> switch on -> enable operation.
@@ -247,17 +254,20 @@ public:
 
   void command_current(const double ros_forward_current_a)
   {
-    // Current command object 6071h:03 uses mA.
+    // Individual target-current objects 6071h:01/:02 use mA.
     // On this robot left motor sign is opposite to ROS forward direction.
     const int16_t left_ma = static_cast<int16_t>(std::lround(
       std::clamp(-ros_forward_current_a * 1000.0, -30000.0, 30000.0)));
     const int16_t right_ma = static_cast<int16_t>(std::lround(
       std::clamp(ros_forward_current_a * 1000.0, -30000.0, 30000.0)));
 
-    const uint32_t combined =
-      (static_cast<uint32_t>(static_cast<uint16_t>(right_ma)) << 16) |
-      static_cast<uint16_t>(left_ma);
-    send_pdo(0x300u + node_id_, combined);
+    // For b0 identification use the individually verified 6071h:01/:02
+    // objects via SDO. A current pulse only changes at pulse start/end, so
+    // 200-Hz RPDO commands are unnecessary during identification.
+    // Write left then right; both remain at their requested value until the
+    // next pulse edge.
+    sdo_write_u16(0x6071, 0x01, static_cast<uint16_t>(left_ma));
+    sdo_write_u16(0x6071, 0x02, static_cast<uint16_t>(right_ma));
   }
 
   void drain_feedback(Feedback & fb)
@@ -268,20 +278,25 @@ public:
       const uint32_t tpdo1 = 0x280u + node_id_;
       const uint32_t tpdo2 = 0x380u + node_id_;
 
-      if (frame.can_id == tpdo0 && frame.can_dlc >= 4) {
-        uint32_t value = 0;
-        std::memcpy(&value, frame.data, sizeof(value));
-        // Preserve the mapping/order already verified on the current robot.
-        const int16_t raw_left = static_cast<int16_t>(value & 0xFFFFu);
-        const int16_t raw_right = static_cast<int16_t>((value >> 16) & 0xFFFFu);
+      if (frame.can_id == tpdo0 && frame.can_dlc >= 8) {
+        // Verified on the actual ZLAC8015D used for this robot:
+        // TPDO0 0x181 = 606Ch:01 (left, I32) + 606Ch:02 (right, I32).
+        // Unit is 0.1 rpm for each 32-bit value.
+        int32_t raw_left = 0;
+        int32_t raw_right = 0;
+        std::memcpy(&raw_left, &frame.data[0], sizeof(raw_left));
+        std::memcpy(&raw_right, &frame.data[4], sizeof(raw_right));
         fb.left_velocity = -static_cast<double>(raw_left) * kRpm01ToRadPerSec;
         fb.right_velocity = static_cast<double>(raw_right) * kRpm01ToRadPerSec;
         fb.velocity_valid = true;
       } else if (frame.can_id == tpdo1 && frame.can_dlc >= 4) {
-        uint32_t value = 0;
-        std::memcpy(&value, frame.data, sizeof(value));
-        const int16_t raw_left = static_cast<int16_t>(value & 0xFFFFu);
-        const int16_t raw_right = static_cast<int16_t>((value >> 16) & 0xFFFFu);
+        // Verified on the actual driver:
+        // TPDO1 0x281 = 6077h:01 (left, I16) + 6077h:02 (right, I16).
+        // Unit is 0.1 A for each 16-bit value.
+        int16_t raw_left = 0;
+        int16_t raw_right = 0;
+        std::memcpy(&raw_left, &frame.data[0], sizeof(raw_left));
+        std::memcpy(&raw_right, &frame.data[2], sizeof(raw_right));
         fb.left_current = -static_cast<double>(raw_left) * 0.1;
         fb.right_current = static_cast<double>(raw_right) * 0.1;
         fb.current_valid = true;
@@ -426,38 +441,69 @@ private:
 
   void configure_feedback_pdos()
   {
-    // TPDO0: 606Ch:03 combined actual velocity, 5 ms.
+    // These mappings were verified on the actual ZLAC8015D/firmware.
+    // Important: 606Ch:03 and 6077h:03 read back as zero on this unit,
+    // while the individual :01/:02 objects update correctly.
+
+    // TPDO0 (0x180 + node):
+    //   606Ch:01 left actual velocity  I32, 0.1 rpm
+    //   606Ch:02 right actual velocity I32, 0.1 rpm
+    // Total = 64 bit = 8 bytes.
+    const uint32_t tpdo0_cob = 0x180u + static_cast<uint32_t>(node_id_);
+    sdo_write_u32(0x1800, 0x01, 0x80000000u | tpdo0_cob);  // disable
     sdo_write_u8(0x1A00, 0x00, 0);
-    sdo_write_u32(0x1A00, 0x01, 0x606C0320u);
-    sdo_write_u8(0x1800, 0x02, 0xFF);
-    sdo_write_u16(0x1800, 0x03, 50);  // 50 * 100 us = 5 ms
-    sdo_write_u16(0x1800, 0x05, 10);  // 10 * 500 us = 5 ms
-    sdo_write_u8(0x1A00, 0x00, 1);
+    sdo_write_u32(0x1A00, 0x01, 0x606C0120u);
+    sdo_write_u32(0x1A00, 0x02, 0x606C0220u);
+    sdo_write_u8(0x1800, 0x02, 0xFF);  // asynchronous/event timer
+    sdo_write_u16(0x1800, 0x03, 0);    // no inhibit; verified working
+    sdo_write_u16(0x1800, 0x05, 10);   // 10 * 500 us = 5 ms = 200 Hz
+    sdo_write_u8(0x1A00, 0x00, 2);
+    sdo_write_u32(0x1800, 0x01, tpdo0_cob);  // enable
 
-    // TPDO1: 6077h:03 combined actual current, 5 ms.
+    // TPDO1 (0x280 + node):
+    //   6077h:01 left actual current  I16, 0.1 A
+    //   6077h:02 right actual current I16, 0.1 A
+    // Total = 32 bit = 4 bytes.
+    const uint32_t tpdo1_cob = 0x280u + static_cast<uint32_t>(node_id_);
+    sdo_write_u32(0x1801, 0x01, 0x80000000u | tpdo1_cob);  // disable
     sdo_write_u8(0x1A01, 0x00, 0);
-    sdo_write_u32(0x1A01, 0x01, 0x60770320u);
+    sdo_write_u32(0x1A01, 0x01, 0x60770110u);
+    sdo_write_u32(0x1A01, 0x02, 0x60770210u);
     sdo_write_u8(0x1801, 0x02, 0xFF);
-    sdo_write_u16(0x1801, 0x03, 50);
-    sdo_write_u16(0x1801, 0x05, 10);
-    sdo_write_u8(0x1A01, 0x00, 1);
+    sdo_write_u16(0x1801, 0x03, 0);
+    sdo_write_u16(0x1801, 0x05, 10);   // 5 ms = 200 Hz
+    sdo_write_u8(0x1A01, 0x00, 2);
+    sdo_write_u32(0x1801, 0x01, tpdo1_cob);  // enable
 
-    // TPDO2: 6064h:01/:02 actual positions, 20 ms.
+    // TPDO2 (0x380 + node): 6064h:01/:02 actual positions, 20 ms.
+    // Keep position feedback separate from the 200-Hz LADRC feedback path.
+    const uint32_t tpdo2_cob = 0x380u + static_cast<uint32_t>(node_id_);
+    sdo_write_u32(0x1802, 0x01, 0x80000000u | tpdo2_cob);  // disable
     sdo_write_u8(0x1A02, 0x00, 0);
     sdo_write_u32(0x1A02, 0x01, 0x60640120u);
     sdo_write_u32(0x1A02, 0x02, 0x60640220u);
     sdo_write_u8(0x1802, 0x02, 0xFF);
-    sdo_write_u16(0x1802, 0x03, 200);
-    sdo_write_u16(0x1802, 0x05, 40);
+    sdo_write_u16(0x1802, 0x03, 0);
+    sdo_write_u16(0x1802, 0x05, 40);   // 40 * 500 us = 20 ms
     sdo_write_u8(0x1A02, 0x00, 2);
+    sdo_write_u32(0x1802, 0x01, tpdo2_cob);  // enable
   }
 
   void configure_torque_rpdo()
   {
-    // RPDO1: 6071h:03 combined target current, low16=left/high16=right [mA].
+    // RPDO1 (0x300 + node): use the individual target-current objects.
+    // The actual driver was verified with 6071h:02 SDO writes; do not rely
+    // on the :03 combined object.
+    //   bytes 0..1 -> 6071h:01 left target current  I16 [mA]
+    //   bytes 2..3 -> 6071h:02 right target current I16 [mA]
+    const uint32_t rpdo1_cob = 0x300u + static_cast<uint32_t>(node_id_);
+    sdo_write_u32(0x1401, 0x01, 0x80000000u | rpdo1_cob);  // disable
     sdo_write_u8(0x1601, 0x00, 0);
-    sdo_write_u32(0x1601, 0x01, 0x60710320u);
-    sdo_write_u8(0x1601, 0x00, 1);
+    sdo_write_u32(0x1601, 0x01, 0x60710110u);
+    sdo_write_u32(0x1601, 0x02, 0x60710210u);
+    sdo_write_u8(0x1401, 0x02, 0xFF);
+    sdo_write_u8(0x1601, 0x00, 2);
+    sdo_write_u32(0x1401, 0x01, rpdo1_cob);  // enable
   }
 
   std::string interface_name_;
@@ -505,6 +551,14 @@ void run_phase(
   double sample_hz)
 {
   const auto period = std::chrono::duration<double>(1.0 / sample_hz);
+
+  // Change the current command only at the phase edge.  The identification
+  // program intentionally uses SDO for target current, while the 200-Hz loop
+  // below is receive/log only.  Repeating SDO writes at 200 Hz would destroy
+  // the intended sampling timing and is unnecessary because 6071h holds its
+  // value until changed.
+  can.command_current(target_current_a);
+
   const auto phase_start = std::chrono::steady_clock::now();
   auto next_tick = phase_start;
 
@@ -515,7 +569,6 @@ void run_phase(
       break;
     }
 
-    can.command_current(target_current_a);
     can.drain_feedback(fb);
     log_row(csv, program_start, trial, phase, elapsed, target_current_a, fb);
 

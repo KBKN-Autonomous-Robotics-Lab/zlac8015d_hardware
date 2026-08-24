@@ -266,10 +266,15 @@ hardware_interface::CallbackReturn Zlac8015dSystemHardware::on_activate(
     }
   }
 
-  // 200Fh:00 = 1: synchronized left/right command update inside the driver.
+  // Match the behavior verified on the actual driver.
+  // Velocity mode retains the original synchronized setting (1).
+  // Torque/LADRC mode uses asynchronous update (0); both target currents are
+  // already carried in the same RPDO frame, so they still update together.
+  const uint8_t command_update_mode =
+    control_mode_ == ControlMode::VELOCITY ? 0x01 : 0x00;
   send_can_frame(
     sdo_id,
-    {0x2B, 0x0F, 0x20, 0x00, 0x01, 0x00, 0x00, 0x00});
+    {0x2B, 0x0F, 0x20, 0x00, command_update_mode, 0x00, 0x00, 0x00});
   sleep_after_sdo();
 
   // NMT: Operational.
@@ -283,6 +288,29 @@ hardware_interface::CallbackReturn Zlac8015dSystemHardware::on_activate(
     sdo_id,
     {0x2F, 0x60, 0x60, 0x00, operation_mode, 0x00, 0x00, 0x00});
   sleep_after_sdo();
+
+  if (control_mode_ == ControlMode::LADRC_TORQUE) {
+    // Driver-side torque slope [mA/s]. Keep it at least as fast as the
+    // software current slew-rate limiter so the outer LADRC remains dominant.
+    const uint32_t slope_ma_per_s = static_cast<uint32_t>(std::lround(
+      clamp(current_rate_limit_a_per_s_ * 1000.0, 1.0, 1000000.0)));
+    const std::vector<uint8_t> slope_left{
+      0x23, 0x87, 0x60, 0x01,
+      static_cast<uint8_t>(slope_ma_per_s & 0xFFu),
+      static_cast<uint8_t>((slope_ma_per_s >> 8) & 0xFFu),
+      static_cast<uint8_t>((slope_ma_per_s >> 16) & 0xFFu),
+      static_cast<uint8_t>((slope_ma_per_s >> 24) & 0xFFu)};
+    const std::vector<uint8_t> slope_right{
+      0x23, 0x87, 0x60, 0x02,
+      static_cast<uint8_t>(slope_ma_per_s & 0xFFu),
+      static_cast<uint8_t>((slope_ma_per_s >> 8) & 0xFFu),
+      static_cast<uint8_t>((slope_ma_per_s >> 16) & 0xFFu),
+      static_cast<uint8_t>((slope_ma_per_s >> 24) & 0xFFu)};
+    send_can_frame(sdo_id, slope_left);
+    sleep_after_sdo();
+    send_can_frame(sdo_id, slope_right);
+    sleep_after_sdo();
+  }
 
   send_zero_command();
 
@@ -395,19 +423,17 @@ hardware_interface::return_type Zlac8015dSystemHardware::read(
   const uint32_t tpdo2_id = 0x380u + node_id_;
 
   while (::read(can_socket_, &frame, sizeof(struct can_frame)) > 0) {
-    // TPDO0: 606Ch:03 actual velocity, unit 0.1 rpm.
-    if (frame.can_id == tpdo0_id && frame.can_dlc >= 4) {
-      uint32_t value = 0;
-      std::memcpy(&value, frame.data, sizeof(value));
-
-      // Preserve the byte ordering verified on the current robot/firmware:
-      // Low 16 = Left, High 16 = Right.
-      const int16_t val_l =
-        static_cast<int16_t>(value & 0xFFFFu);
-      const int16_t val_r =
-        static_cast<int16_t>((value >> 16) & 0xFFFFu);
+    // TPDO0 (verified on the actual driver):
+    // 606Ch:01 left actual velocity I32 + 606Ch:02 right actual velocity I32.
+    // Each value is in 0.1 rpm; total frame length is 8 bytes.
+    if (frame.can_id == tpdo0_id && frame.can_dlc >= 8) {
+      int32_t val_l = 0;
+      int32_t val_r = 0;
+      std::memcpy(&val_l, &frame.data[0], sizeof(val_l));
+      std::memcpy(&val_r, &frame.data[4], sizeof(val_r));
 
       // ROS convention: both wheel velocities are positive for forward motion.
+      // The left motor's driver-positive direction is opposite to ROS-forward.
       hw_velocities_[0] =
         -static_cast<double>(val_l) * RPM01_TO_RAD_PER_SEC;
       hw_velocities_[1] =
@@ -417,15 +443,14 @@ hardware_interface::return_type Zlac8015dSystemHardware::read(
       last_velocity_feedback_time_ = std::chrono::steady_clock::now();
       feedback_timeout_reported_ = false;
     }
-    // TPDO1: 6077h:03 actual current, unit 0.1 A.
+    // TPDO1 (verified on the actual driver):
+    // 6077h:01 left actual current I16 + 6077h:02 right actual current I16.
+    // Each value is in 0.1 A; total frame length is 4 bytes.
     else if (frame.can_id == tpdo1_id && frame.can_dlc >= 4) {
-      uint32_t value = 0;
-      std::memcpy(&value, frame.data, sizeof(value));
-
-      const int16_t val_l =
-        static_cast<int16_t>(value & 0xFFFFu);
-      const int16_t val_r =
-        static_cast<int16_t>((value >> 16) & 0xFFFFu);
+      int16_t val_l = 0;
+      int16_t val_r = 0;
+      std::memcpy(&val_l, &frame.data[0], sizeof(val_l));
+      std::memcpy(&val_r, &frame.data[2], sizeof(val_r));
 
       // Same ROS-forward sign convention as velocity.
       hw_efforts_[0] = -static_cast<double>(val_l) * 0.1;
@@ -540,14 +565,14 @@ hardware_interface::return_type Zlac8015dSystemHardware::write(
   const int16_t cmd_r_ma = static_cast<int16_t>(
     std::lround(clamp(cmd_current_r * 1000.0, -30000.0, 30000.0)));
 
-  const uint32_t combined_cmd =
-    (static_cast<uint32_t>(static_cast<uint16_t>(cmd_r_ma)) << 16) |
-    static_cast<uint16_t>(cmd_l_ma);
-
+  // RPDO1 mapping is 6071h:01 (left I16) followed by 6071h:02 (right I16).
+  // Packing these two int16 values produces the same 4-byte little-endian
+  // payload shape, but no :03 combined object is involved.
   struct can_frame frame {};
   frame.can_id = 0x300u + node_id_;
   frame.can_dlc = 4;
-  std::memcpy(frame.data, &combined_cmd, sizeof(combined_cmd));
+  std::memcpy(&frame.data[0], &cmd_l_ma, sizeof(cmd_l_ma));
+  std::memcpy(&frame.data[2], &cmd_r_ma, sizeof(cmd_r_ma));
 
   if (::write(can_socket_, &frame, sizeof(struct can_frame)) <= 0) {
     return hardware_interface::return_type::ERROR;
@@ -613,51 +638,78 @@ bool Zlac8015dSystemHardware::configure_feedback_pdos()
 {
   const uint32_t sdo_id = 0x600u + node_id_;
 
-  // TPDO0 (0x180 + node): 606Ch:03 combined actual velocity, 32 bit.
-  if (!send_can_frame(sdo_id, {0x2F, 0x00, 0x1A, 0x00, 0, 0, 0, 0})) {return false;}
-  sleep_after_sdo();
-  if (!send_can_frame(sdo_id, {0x23, 0x00, 0x1A, 0x01, 0x20, 0x03, 0x6C, 0x60})) {return false;}
-  sleep_after_sdo();
-  if (!send_can_frame(sdo_id, {0x2F, 0x00, 0x18, 0x02, 0xFF, 0, 0, 0})) {return false;}
-  sleep_after_sdo();
-  // Inhibit: 50 * 100 us = 5 ms.
-  if (!send_can_frame(sdo_id, {0x2B, 0x00, 0x18, 0x03, 0x32, 0x00, 0, 0})) {return false;}
-  sleep_after_sdo();
-  // Event timer: 10 * 500 us = 5 ms.
-  if (!send_can_frame(sdo_id, {0x2B, 0x00, 0x18, 0x05, 0x0A, 0x00, 0, 0})) {return false;}
-  sleep_after_sdo();
-  if (!send_can_frame(sdo_id, {0x2F, 0x00, 0x1A, 0x00, 0x01, 0, 0, 0})) {return false;}
-  sleep_after_sdo();
+  auto sdo_u8 = [&](uint16_t index, uint8_t sub, uint8_t value) {
+    return send_can_frame(
+      sdo_id,
+      {0x2F,
+       static_cast<uint8_t>(index & 0xFFu),
+       static_cast<uint8_t>((index >> 8) & 0xFFu),
+       sub, value, 0, 0, 0});
+  };
+  auto sdo_u16 = [&](uint16_t index, uint8_t sub, uint16_t value) {
+    return send_can_frame(
+      sdo_id,
+      {0x2B,
+       static_cast<uint8_t>(index & 0xFFu),
+       static_cast<uint8_t>((index >> 8) & 0xFFu),
+       sub,
+       static_cast<uint8_t>(value & 0xFFu),
+       static_cast<uint8_t>((value >> 8) & 0xFFu), 0, 0});
+  };
+  auto sdo_u32 = [&](uint16_t index, uint8_t sub, uint32_t value) {
+    return send_can_frame(
+      sdo_id,
+      {0x23,
+       static_cast<uint8_t>(index & 0xFFu),
+       static_cast<uint8_t>((index >> 8) & 0xFFu),
+       sub,
+       static_cast<uint8_t>(value & 0xFFu),
+       static_cast<uint8_t>((value >> 8) & 0xFFu),
+       static_cast<uint8_t>((value >> 16) & 0xFFu),
+       static_cast<uint8_t>((value >> 24) & 0xFFu)});
+  };
+  auto pause = []() { sleep_after_sdo(); };
 
-  // TPDO1 (0x280 + node): 6077h:03 combined actual current, 32 bit.
-  if (!send_can_frame(sdo_id, {0x2F, 0x01, 0x1A, 0x00, 0, 0, 0, 0})) {return false;}
-  sleep_after_sdo();
-  if (!send_can_frame(sdo_id, {0x23, 0x01, 0x1A, 0x01, 0x20, 0x03, 0x77, 0x60})) {return false;}
-  sleep_after_sdo();
-  if (!send_can_frame(sdo_id, {0x2F, 0x01, 0x18, 0x02, 0xFF, 0, 0, 0})) {return false;}
-  sleep_after_sdo();
-  if (!send_can_frame(sdo_id, {0x2B, 0x01, 0x18, 0x03, 0x32, 0x00, 0, 0})) {return false;}
-  sleep_after_sdo();
-  if (!send_can_frame(sdo_id, {0x2B, 0x01, 0x18, 0x05, 0x0A, 0x00, 0, 0})) {return false;}
-  sleep_after_sdo();
-  if (!send_can_frame(sdo_id, {0x2F, 0x01, 0x1A, 0x00, 0x01, 0, 0, 0})) {return false;}
-  sleep_after_sdo();
+  // TPDO0 (0x180 + node): verified working on the actual ZLAC8015D.
+  // 606Ch:01 left velocity I32 + 606Ch:02 right velocity I32 = 8 bytes.
+  // The :03 combined object returned zero on this unit and is not used.
+  const uint32_t tpdo0_cob = 0x180u + node_id_;
+  if (!sdo_u32(0x1800, 0x01, 0x80000000u | tpdo0_cob)) {return false;} pause();
+  if (!sdo_u8(0x1A00, 0x00, 0)) {return false;} pause();
+  if (!sdo_u32(0x1A00, 0x01, 0x606C0120u)) {return false;} pause();
+  if (!sdo_u32(0x1A00, 0x02, 0x606C0220u)) {return false;} pause();
+  if (!sdo_u8(0x1800, 0x02, 0xFF)) {return false;} pause();
+  // Match the configuration verified manually: inhibit=0, event=5 ms.
+  if (!sdo_u16(0x1800, 0x03, 0)) {return false;} pause();
+  if (!sdo_u16(0x1800, 0x05, 10)) {return false;} pause();
+  if (!sdo_u8(0x1A00, 0x00, 2)) {return false;} pause();
+  if (!sdo_u32(0x1800, 0x01, tpdo0_cob)) {return false;} pause();
 
-  // TPDO2 (0x380 + node): 6064h:01 and :02 actual positions, 20 ms.
-  if (!send_can_frame(sdo_id, {0x2F, 0x02, 0x1A, 0x00, 0, 0, 0, 0})) {return false;}
-  sleep_after_sdo();
-  if (!send_can_frame(sdo_id, {0x23, 0x02, 0x1A, 0x01, 0x20, 0x01, 0x64, 0x60})) {return false;}
-  sleep_after_sdo();
-  if (!send_can_frame(sdo_id, {0x23, 0x02, 0x1A, 0x02, 0x20, 0x02, 0x64, 0x60})) {return false;}
-  sleep_after_sdo();
-  if (!send_can_frame(sdo_id, {0x2F, 0x02, 0x18, 0x02, 0xFF, 0, 0, 0})) {return false;}
-  sleep_after_sdo();
-  if (!send_can_frame(sdo_id, {0x2B, 0x02, 0x18, 0x03, 0xC8, 0x00, 0, 0})) {return false;}
-  sleep_after_sdo();
-  if (!send_can_frame(sdo_id, {0x2B, 0x02, 0x18, 0x05, 0x28, 0x00, 0, 0})) {return false;}
-  sleep_after_sdo();
-  if (!send_can_frame(sdo_id, {0x2F, 0x02, 0x1A, 0x00, 0x02, 0, 0, 0})) {return false;}
-  sleep_after_sdo();
+  // TPDO1 (0x280 + node): verified working on the actual ZLAC8015D.
+  // 6077h:01 left current I16 + 6077h:02 right current I16 = 4 bytes.
+  // Each raw count is 0.1 A.
+  const uint32_t tpdo1_cob = 0x280u + node_id_;
+  if (!sdo_u32(0x1801, 0x01, 0x80000000u | tpdo1_cob)) {return false;} pause();
+  if (!sdo_u8(0x1A01, 0x00, 0)) {return false;} pause();
+  if (!sdo_u32(0x1A01, 0x01, 0x60770110u)) {return false;} pause();
+  if (!sdo_u32(0x1A01, 0x02, 0x60770210u)) {return false;} pause();
+  if (!sdo_u8(0x1801, 0x02, 0xFF)) {return false;} pause();
+  if (!sdo_u16(0x1801, 0x03, 0)) {return false;} pause();
+  if (!sdo_u16(0x1801, 0x05, 10)) {return false;} pause();
+  if (!sdo_u8(0x1A01, 0x00, 2)) {return false;} pause();
+  if (!sdo_u32(0x1801, 0x01, tpdo1_cob)) {return false;} pause();
+
+  // TPDO2 (0x380 + node): wheel positions, 20 ms.
+  const uint32_t tpdo2_cob = 0x380u + node_id_;
+  if (!sdo_u32(0x1802, 0x01, 0x80000000u | tpdo2_cob)) {return false;} pause();
+  if (!sdo_u8(0x1A02, 0x00, 0)) {return false;} pause();
+  if (!sdo_u32(0x1A02, 0x01, 0x60640120u)) {return false;} pause();
+  if (!sdo_u32(0x1A02, 0x02, 0x60640220u)) {return false;} pause();
+  if (!sdo_u8(0x1802, 0x02, 0xFF)) {return false;} pause();
+  if (!sdo_u16(0x1802, 0x03, 0)) {return false;} pause();
+  if (!sdo_u16(0x1802, 0x05, 40)) {return false;} pause();
+  if (!sdo_u8(0x1A02, 0x00, 2)) {return false;} pause();
+  if (!sdo_u32(0x1802, 0x01, tpdo2_cob)) {return false;} pause();
 
   return true;
 }
@@ -679,15 +731,44 @@ bool Zlac8015dSystemHardware::configure_velocity_rpdo()
 bool Zlac8015dSystemHardware::configure_torque_rpdo()
 {
   const uint32_t sdo_id = 0x600u + node_id_;
+  const uint32_t rpdo1_cob = 0x300u + node_id_;
 
-  // RPDO1 (0x300 + node): 6071h:03 combined target torque/current, 32 bit.
-  // Low 16 = left [mA], High 16 = right [mA].
-  if (!send_can_frame(sdo_id, {0x2F, 0x01, 0x16, 0x00, 0, 0, 0, 0})) {return false;}
-  sleep_after_sdo();
-  if (!send_can_frame(sdo_id, {0x23, 0x01, 0x16, 0x01, 0x20, 0x03, 0x71, 0x60})) {return false;}
-  sleep_after_sdo();
-  if (!send_can_frame(sdo_id, {0x2F, 0x01, 0x16, 0x00, 0x01, 0, 0, 0})) {return false;}
-  sleep_after_sdo();
+  auto send_u8 = [&](uint16_t index, uint8_t sub, uint8_t value) {
+    const bool ok = send_can_frame(
+      sdo_id,
+      {0x2F,
+       static_cast<uint8_t>(index & 0xFFu),
+       static_cast<uint8_t>((index >> 8) & 0xFFu),
+       sub, value, 0, 0, 0});
+    sleep_after_sdo();
+    return ok;
+  };
+  auto send_u32 = [&](uint16_t index, uint8_t sub, uint32_t value) {
+    const bool ok = send_can_frame(
+      sdo_id,
+      {0x23,
+       static_cast<uint8_t>(index & 0xFFu),
+       static_cast<uint8_t>((index >> 8) & 0xFFu),
+       sub,
+       static_cast<uint8_t>(value & 0xFFu),
+       static_cast<uint8_t>((value >> 8) & 0xFFu),
+       static_cast<uint8_t>((value >> 16) & 0xFFu),
+       static_cast<uint8_t>((value >> 24) & 0xFFu)});
+    sleep_after_sdo();
+    return ok;
+  };
+
+  // RPDO1 (0x300 + node): individual target-current objects verified on
+  // this driver.  Do not use 6071h:03.
+  // bytes 0..1 = 6071h:01 left I16 [mA]
+  // bytes 2..3 = 6071h:02 right I16 [mA]
+  if (!send_u32(0x1401, 0x01, 0x80000000u | rpdo1_cob)) {return false;}
+  if (!send_u8(0x1601, 0x00, 0)) {return false;}
+  if (!send_u32(0x1601, 0x01, 0x60710110u)) {return false;}
+  if (!send_u32(0x1601, 0x02, 0x60710210u)) {return false;}
+  if (!send_u8(0x1401, 0x02, 0xFF)) {return false;}
+  if (!send_u8(0x1601, 0x00, 2)) {return false;}
+  if (!send_u32(0x1401, 0x01, rpdo1_cob)) {return false;}
   return true;
 }
 
