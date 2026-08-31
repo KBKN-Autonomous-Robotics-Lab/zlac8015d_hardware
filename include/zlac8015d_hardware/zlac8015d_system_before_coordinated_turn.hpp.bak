@@ -87,8 +87,7 @@ private:
     double velocity_reference,
     double velocity_measured,
     double current_measured,
-    double dt,
-    bool allow_track_transition);
+    double dt);
   static double clamp(double value, double lower, double upper);
 
   // ros2_control command / state

@@ -36,6 +36,11 @@ add_executable(b0_identification
 )
 target_compile_features(b0_identification PUBLIC cxx_std_17)
 
+add_executable(b0_identification_moving
+  src/b0_identification_moving.cpp
+)
+target_compile_features(b0_identification_moving PUBLIC cxx_std_17)
+
 
 # Standalone LADRC step-response validation tool. It talks directly to
 # SocketCAN so ros2_control cannot overwrite the test current.
@@ -46,13 +51,44 @@ target_compile_features(ladrc_step_response PUBLIC cxx_std_17)
 
 pluginlib_export_plugin_description_file(hardware_interface zlac8015d_hardware.xml)
 
+add_executable(
+  breakaway_current_identification
+  src/breakaway_current_identification.cpp
+)
+
+target_compile_features(
+  breakaway_current_identification
+  PUBLIC cxx_std_17
+)
+
+add_executable(
+  ground_startability_test
+  src/ground_startability_test.cpp
+)
+
+target_compile_features(
+  ground_startability_test
+  PUBLIC cxx_std_17
+)
+
 install(
   TARGETS zlac8015d_hardware
   DESTINATION lib
 )
 
 install(
-  TARGETS b0_identification ladrc_step_response
+  TARGETS
+    b0_identification
+    b0_identification_moving
+    ladrc_step_response
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(
+  TARGETS
+    ladrc_step_response
+    breakaway_current_identification
+    ground_startability_test
   DESTINATION lib/${PROJECT_NAME}
 )
 

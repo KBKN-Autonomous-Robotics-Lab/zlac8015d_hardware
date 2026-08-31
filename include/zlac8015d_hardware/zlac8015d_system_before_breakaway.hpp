@@ -45,23 +45,6 @@ private:
     double b0{1.0};          // nominal input gain [(rad/s^2)/A]
     double last_current_cmd{0.0};
     bool initialized{false};
-
-    // --------------------------------------------------------
-    // BREAKAWAY / TRACK state
-    // --------------------------------------------------------
-    bool tracking{false};
-
-    int start_count{0};
-    int stall_count{0};
-
-    int breakaway_count{0};
-    double breakaway_target{0.65};
-
-    int track_hold_count{0};
-    double track_hold_start{0.20};
-
-    // +1 forward, -1 reverse, 0 stopped/uninitialized
-    int direction_sign{0};
   };
 
   enum class ControlMode
@@ -87,8 +70,7 @@ private:
     double velocity_reference,
     double velocity_measured,
     double current_measured,
-    double dt,
-    bool allow_track_transition);
+    double dt);
   static double clamp(double value, double lower, double upper);
 
   // ros2_control command / state

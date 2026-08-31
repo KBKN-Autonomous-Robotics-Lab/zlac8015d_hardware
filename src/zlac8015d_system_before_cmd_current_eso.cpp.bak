@@ -548,14 +548,10 @@ hardware_interface::return_type Zlac8015dSystemHardware::write(
   // Protect the explicit Euler observer from a large scheduler hiccup.
   dt = clamp(dt, 0.001, 0.020);
 
-  // LESO input: previous-cycle commanded current.
-  // This defines the LADRC plant input as the current command sent
-  // to the motor driver. Current-loop dynamics and command/actual
-  // current mismatch are then absorbed into z2 as total disturbance.
   const double current_l_measured =
-    left_ladrc_.last_current_cmd;
+    current_feedback_received_ ? hw_efforts_[0] : left_ladrc_.last_current_cmd;
   const double current_r_measured =
-    right_ladrc_.last_current_cmd;
+    current_feedback_received_ ? hw_efforts_[1] : right_ladrc_.last_current_cmd;
 
   // ----------------------------------------------------------
   // Coordinated BREAKAWAY for near-pure in-place turns.
@@ -719,7 +715,6 @@ hardware_interface::return_type Zlac8015dSystemHardware::write(
         << "time_s,"
         << "ref_left_rad_s,ref_right_rad_s,"
         << "vel_left_rad_s,vel_right_rad_s,"
-        << "pos_left_rad,pos_right_rad,"
         << "cmd_current_left_A,cmd_current_right_A,"
         << "actual_current_left_A,actual_current_right_A,"
         << "z1_left,z1_right,"
@@ -747,8 +742,6 @@ hardware_interface::return_type Zlac8015dSystemHardware::write(
       << hw_commands_[1] << ","
       << hw_velocities_[0] << ","
       << hw_velocities_[1] << ","
-      << hw_positions_[0] << ","
-      << hw_positions_[1] << ","
       << cmd_current_l << ","
       << cmd_current_r << ","
       << current_l_measured << ","

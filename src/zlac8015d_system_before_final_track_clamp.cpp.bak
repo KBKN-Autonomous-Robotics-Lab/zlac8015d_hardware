@@ -13,8 +13,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <fstream>
-#include <iomanip>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -548,14 +546,10 @@ hardware_interface::return_type Zlac8015dSystemHardware::write(
   // Protect the explicit Euler observer from a large scheduler hiccup.
   dt = clamp(dt, 0.001, 0.020);
 
-  // LESO input: previous-cycle commanded current.
-  // This defines the LADRC plant input as the current command sent
-  // to the motor driver. Current-loop dynamics and command/actual
-  // current mismatch are then absorbed into z2 as total disturbance.
   const double current_l_measured =
-    left_ladrc_.last_current_cmd;
+    current_feedback_received_ ? hw_efforts_[0] : left_ladrc_.last_current_cmd;
   const double current_r_measured =
-    right_ladrc_.last_current_cmd;
+    current_feedback_received_ ? hw_efforts_[1] : right_ladrc_.last_current_cmd;
 
   // ----------------------------------------------------------
   // Coordinated BREAKAWAY for near-pure in-place turns.
@@ -699,73 +693,6 @@ hardware_interface::return_type Zlac8015dSystemHardware::write(
 
   if (::write(can_socket_, &frame, sizeof(struct can_frame)) <= 0) {
     return hardware_interface::return_type::ERROR;
-  }
-
-  // ==========================================================
-  // 200 Hz LADRC runtime CSV logger
-  // ==========================================================
-  static std::ofstream csv_log;
-  static bool csv_initialized = false;
-  static std::chrono::steady_clock::time_point csv_start_time;
-  static int csv_flush_count = 0;
-
-  if (!csv_initialized) {
-    csv_log.open(
-      "/tmp/ladrc_track_200hz.csv",
-      std::ios::out | std::ios::trunc);
-
-    if (csv_log.is_open()) {
-      csv_log
-        << "time_s,"
-        << "ref_left_rad_s,ref_right_rad_s,"
-        << "vel_left_rad_s,vel_right_rad_s,"
-        << "pos_left_rad,pos_right_rad,"
-        << "cmd_current_left_A,cmd_current_right_A,"
-        << "actual_current_left_A,actual_current_right_A,"
-        << "z1_left,z1_right,"
-        << "z2_left,z2_right,"
-        << "tracking_left,tracking_right,"
-        << "breakaway_target_left_A,breakaway_target_right_A"
-        << '\n';
-
-      csv_log << std::setprecision(10);
-      csv_start_time = std::chrono::steady_clock::now();
-    }
-
-    csv_initialized = true;
-  }
-
-  if (csv_log.is_open()) {
-    const double csv_time_s =
-      std::chrono::duration<double>(
-        std::chrono::steady_clock::now() -
-        csv_start_time).count();
-
-    csv_log
-      << csv_time_s << ","
-      << hw_commands_[0] << ","
-      << hw_commands_[1] << ","
-      << hw_velocities_[0] << ","
-      << hw_velocities_[1] << ","
-      << hw_positions_[0] << ","
-      << hw_positions_[1] << ","
-      << cmd_current_l << ","
-      << cmd_current_r << ","
-      << current_l_measured << ","
-      << current_r_measured << ","
-      << left_ladrc_.z1 << ","
-      << right_ladrc_.z1 << ","
-      << left_ladrc_.z2 << ","
-      << right_ladrc_.z2 << ","
-      << static_cast<int>(left_ladrc_.tracking) << ","
-      << static_cast<int>(right_ladrc_.tracking) << ","
-      << left_ladrc_.breakaway_target << ","
-      << right_ladrc_.breakaway_target
-      << '\n';
-
-    if (++csv_flush_count % 200 == 0) {
-      csv_log.flush();
-    }
   }
 
   static int debug_count = 0;
@@ -1073,16 +1000,6 @@ double Zlac8015dSystemHardware::compute_ladrc_current(
       static_cast<double>(direction) *
       floor_a;
   }
-
-  // Final hard TRACK current limit.
-  //
-  // TRACK_HOLD / floor is applied after the LADRC clamp above,
-  // so it must not be allowed to raise the final command beyond
-  // current_limit_a_.
-  current_command = clamp(
-    current_command,
-    -current_limit_a_,
-    +current_limit_a_);
 
 
   // ==========================================================

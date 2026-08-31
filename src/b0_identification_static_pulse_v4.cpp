@@ -1,0 +1,802 @@
+#include <linux/can.h>
+#include <linux/can/raw.h>
+#include <net/if.h>
+#include <poll.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <fcntl.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <csignal>
+#include <cstdint>
+#include <cstring>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace
+{
+
+constexpr double kRpm01ToRadPerSec = 0.01047197551;
+constexpr double kEncoderCountsPerRev = 4096.0;
+constexpr double kTwoPi = 6.28318530717958647692;
+constexpr double kRadPerEncoderCount = kTwoPi / kEncoderCountsPerRev;
+
+std::atomic<bool> g_keep_running{true};
+
+void signal_handler(int)
+{
+  g_keep_running.store(false);
+}
+
+struct Options
+{
+  std::string can_interface{"can0"};
+  int node_id{1};
+  std::vector<double> currents_a{0.5, 1.0, 1.5};
+  int repeats{3};
+  double pulse_s{0.20};
+  double sample_hz{200.0};
+  double max_current_a{1.5};
+
+  // A trial starts only after BOTH wheels remain below stop_threshold_rad_s
+  // continuously for stop_hold_s.  If this does not happen before
+  // stop_timeout_s, that trial is skipped without applying current.
+  double stop_threshold_rad_s{0.15};
+  double stop_hold_s{0.50};
+  double stop_timeout_s{15.0};
+
+  bool bidirectional{false};
+  bool run{false};
+  std::string output{"b0_identification_v4.csv"};
+};
+
+struct Feedback
+{
+  double left_velocity{0.0};
+  double right_velocity{0.0};
+  double left_current{0.0};
+  double right_current{0.0};
+  double left_position{0.0};
+  double right_position{0.0};
+  bool velocity_valid{false};
+  bool current_valid{false};
+  bool position_valid{false};
+
+  int32_t raw_left{0};
+  int32_t raw_right{0};
+  int32_t last_raw_left{0};
+  int32_t last_raw_right{0};
+  int64_t accumulated_left{0};
+  int64_t accumulated_right{0};
+};
+
+int64_t wrapped_count_delta(const int32_t current, const int32_t previous)
+{
+  int64_t delta = static_cast<int64_t>(current) - static_cast<int64_t>(previous);
+  constexpr int64_t modulo = (int64_t{1} << 32);
+  if (delta > INT32_MAX) {
+    delta -= modulo;
+  } else if (delta < INT32_MIN) {
+    delta += modulo;
+  }
+  return delta;
+}
+
+std::vector<double> parse_currents(const std::string & text)
+{
+  std::vector<double> values;
+  std::stringstream ss(text);
+  std::string token;
+  while (std::getline(ss, token, ',')) {
+    if (!token.empty()) {
+      values.push_back(std::stod(token));
+    }
+  }
+  if (values.empty()) {
+    throw std::runtime_error("--currents must contain at least one value");
+  }
+  return values;
+}
+
+void print_usage(const char * argv0)
+{
+  std::cout
+    << "Usage: " << argv0 << " --run [options]\n\n"
+    << "WARNING: this program commands motor current and moves the robot.\n"
+    << "Use a safe test setup with a clear emergency-stop path.\n\n"
+    << "Identification sequence:\n"
+    << "  zero current -> wait until both wheels are stopped -> short pulse -> zero current\n"
+    << "  With --bidirectional, +I/-I are interleaved to improve identifiability.\n\n"
+    << "Options:\n"
+    << "  --can can0                   SocketCAN interface (default can0)\n"
+    << "  --node 1                     CANopen node ID (default 1)\n"
+    << "  --currents 0.5,1.0,1.5      Positive current magnitudes in A\n"
+    << "  --repeats 3                  Repetitions of the full current set\n"
+    << "  --pulse 0.20                 Current-pulse duration in s\n"
+    << "  --sample-hz 200              Feedback/logging frequency\n"
+    << "  --max-current 1.5            Hard software safety limit in A\n"
+    << "  --stop-threshold 0.15        Required |wheel speed| in rad/s\n"
+    << "  --stop-hold 0.50             Required continuous stopped time in s\n"
+    << "  --stop-timeout 15.0          Skip trial if stop is not reached in s\n"
+    << "  --bidirectional              Interleave positive and negative pulses\n"
+    << "  --output FILE.csv            Output CSV path\n"
+    << "  --run                        Required to enable motor commands\n";
+}
+
+Options parse_options(int argc, char ** argv)
+{
+  Options opt;
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    auto require_value = [&](const std::string & name) -> std::string {
+      if (i + 1 >= argc) {
+        throw std::runtime_error("Missing value after " + name);
+      }
+      return argv[++i];
+    };
+
+    if (arg == "--can") {
+      opt.can_interface = require_value(arg);
+    } else if (arg == "--node") {
+      opt.node_id = std::stoi(require_value(arg));
+    } else if (arg == "--currents") {
+      opt.currents_a = parse_currents(require_value(arg));
+    } else if (arg == "--repeats") {
+      opt.repeats = std::stoi(require_value(arg));
+    } else if (arg == "--pulse") {
+      opt.pulse_s = std::stod(require_value(arg));
+    } else if (arg == "--sample-hz") {
+      opt.sample_hz = std::stod(require_value(arg));
+    } else if (arg == "--max-current") {
+      opt.max_current_a = std::stod(require_value(arg));
+    } else if (arg == "--stop-threshold") {
+      opt.stop_threshold_rad_s = std::stod(require_value(arg));
+    } else if (arg == "--stop-hold") {
+      opt.stop_hold_s = std::stod(require_value(arg));
+    } else if (arg == "--stop-timeout") {
+      opt.stop_timeout_s = std::stod(require_value(arg));
+    } else if (arg == "--output") {
+      opt.output = require_value(arg);
+    } else if (arg == "--bidirectional") {
+      opt.bidirectional = true;
+    } else if (arg == "--run") {
+      opt.run = true;
+    } else if (arg == "--settle") {
+      // Backward-compatible with v3 command lines.  Fixed settle time is no
+      // longer used; stop detection is based on measured wheel speed.
+      (void)require_value(arg);
+      std::cerr << "NOTE: --settle is ignored in v4; use --stop-threshold, "
+                   "--stop-hold and --stop-timeout instead.\\n";
+    } else if (arg == "--help" || arg == "-h") {
+      print_usage(argv[0]);
+      std::exit(0);
+    } else {
+      throw std::runtime_error("Unknown argument: " + arg);
+    }
+  }
+
+  if (opt.node_id < 1 || opt.node_id > 127 || opt.repeats <= 0 ||
+      opt.pulse_s <= 0.0 || opt.sample_hz <= 0.0 ||
+      opt.max_current_a <= 0.0 || opt.stop_threshold_rad_s <= 0.0 ||
+      opt.stop_hold_s <= 0.0 || opt.stop_timeout_s <= opt.stop_hold_s)
+  {
+    throw std::runtime_error("Invalid numeric option");
+  }
+
+  for (double current : opt.currents_a) {
+    if (current <= 0.0 || current > opt.max_current_a) {
+      throw std::runtime_error(
+        "Each --currents value must be > 0 and <= --max-current");
+    }
+  }
+  return opt;
+}
+
+class ZlacCan
+{
+public:
+  ZlacCan(std::string interface_name, int node_id)
+  : interface_name_(std::move(interface_name)), node_id_(node_id)
+  {
+  }
+
+  ~ZlacCan()
+  {
+    if (socket_ >= 0) {
+      command_current(0.0);
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      try {
+        sdo_write_u16(0x6040, 0x00, 0x0006);
+      } catch (...) {
+      }
+      close(socket_);
+    }
+  }
+
+  void open_socket()
+  {
+    socket_ = socket(PF_CAN, SOCK_RAW, CAN_RAW);
+    if (socket_ < 0) {
+      throw std::runtime_error("Failed to create CAN socket");
+    }
+
+    struct ifreq ifr {};
+    std::strncpy(ifr.ifr_name, interface_name_.c_str(), IFNAMSIZ - 1);
+    if (ioctl(socket_, SIOCGIFINDEX, &ifr) < 0) {
+      throw std::runtime_error("Failed to get interface index for " + interface_name_);
+    }
+
+    struct sockaddr_can addr {};
+    addr.can_family = AF_CAN;
+    addr.can_ifindex = ifr.ifr_ifindex;
+    if (bind(socket_, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+      throw std::runtime_error("Failed to bind CAN socket to " + interface_name_);
+    }
+    fcntl(socket_, F_SETFL, O_NONBLOCK);
+  }
+
+  void configure_for_identification()
+  {
+    nmt(0x80);  // pre-operational
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    configure_feedback_pdos();
+    configure_torque_rpdo();
+
+    // Identification uses immediate/asynchronous target-current updates.
+    // This avoids depending on RPDO processing while we validate torque mode.
+    sdo_write_u16(0x200F, 0x00, 0);
+
+    nmt(0x01);  // operational
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    sdo_write_u8(0x6060, 0x00, 4);  // Profile Torque Mode
+
+    // Make the torque/current ramp fast enough for a short identification pulse.
+    // ZLAC8015D 6087h:01/:02 are torque slopes in mA/s.
+    sdo_write_u32(0x6087, 0x01, 20000);
+    sdo_write_u32(0x6087, 0x02, 20000);
+
+    command_current(0.0);
+
+    // CiA402 servo on: shutdown -> switch on -> enable operation.
+    sdo_write_u16(0x6040, 0x00, 0x0006);
+    sdo_write_u16(0x6040, 0x00, 0x0007);
+    sdo_write_u16(0x6040, 0x00, 0x000F);
+  }
+
+  void command_current(const double ros_forward_current_a)
+  {
+    // Individual target-current objects 6071h:01/:02 use mA.
+    // On this robot left motor sign is opposite to ROS forward direction.
+    const int16_t left_ma = static_cast<int16_t>(std::lround(
+      std::clamp(-ros_forward_current_a * 1000.0, -30000.0, 30000.0)));
+    const int16_t right_ma = static_cast<int16_t>(std::lround(
+      std::clamp(ros_forward_current_a * 1000.0, -30000.0, 30000.0)));
+
+    // For b0 identification use the individually verified 6071h:01/:02
+    // objects via SDO. A current pulse only changes at pulse start/end, so
+    // 200-Hz RPDO commands are unnecessary during identification.
+    // Write left then right; both remain at their requested value until the
+    // next pulse edge.
+    sdo_write_u16(0x6071, 0x01, static_cast<uint16_t>(left_ma));
+    sdo_write_u16(0x6071, 0x02, static_cast<uint16_t>(right_ma));
+  }
+
+  void drain_feedback(Feedback & fb)
+  {
+    struct can_frame frame {};
+    while (::read(socket_, &frame, sizeof(frame)) > 0) {
+      const uint32_t tpdo0 = 0x180u + node_id_;
+      const uint32_t tpdo1 = 0x280u + node_id_;
+      const uint32_t tpdo2 = 0x380u + node_id_;
+
+      if (frame.can_id == tpdo0 && frame.can_dlc >= 8) {
+        // Verified on the actual ZLAC8015D used for this robot:
+        // TPDO0 0x181 = 606Ch:01 (left, I32) + 606Ch:02 (right, I32).
+        // Unit is 0.1 rpm for each 32-bit value.
+        int32_t raw_left = 0;
+        int32_t raw_right = 0;
+        std::memcpy(&raw_left, &frame.data[0], sizeof(raw_left));
+        std::memcpy(&raw_right, &frame.data[4], sizeof(raw_right));
+        fb.left_velocity = -static_cast<double>(raw_left) * kRpm01ToRadPerSec;
+        fb.right_velocity = static_cast<double>(raw_right) * kRpm01ToRadPerSec;
+        fb.velocity_valid = true;
+      } else if (frame.can_id == tpdo1 && frame.can_dlc >= 4) {
+        // Verified on the actual driver:
+        // TPDO1 0x281 = 6077h:01 (left, I16) + 6077h:02 (right, I16).
+        // Unit is 0.1 A for each 16-bit value.
+        int16_t raw_left = 0;
+        int16_t raw_right = 0;
+        std::memcpy(&raw_left, &frame.data[0], sizeof(raw_left));
+        std::memcpy(&raw_right, &frame.data[2], sizeof(raw_right));
+        fb.left_current = -static_cast<double>(raw_left) * 0.1;
+        fb.right_current = static_cast<double>(raw_right) * 0.1;
+        fb.current_valid = true;
+      } else if (frame.can_id == tpdo2 && frame.can_dlc >= 8) {
+        int32_t raw_left = 0;
+        int32_t raw_right = 0;
+        std::memcpy(&raw_left, &frame.data[0], sizeof(raw_left));
+        std::memcpy(&raw_right, &frame.data[4], sizeof(raw_right));
+
+        if (!fb.position_valid) {
+          fb.raw_left = raw_left;
+          fb.raw_right = raw_right;
+          fb.last_raw_left = raw_left;
+          fb.last_raw_right = raw_right;
+          fb.accumulated_left = 0;
+          fb.accumulated_right = 0;
+          fb.position_valid = true;
+        } else {
+          fb.accumulated_left += wrapped_count_delta(raw_left, fb.last_raw_left);
+          fb.accumulated_right += wrapped_count_delta(raw_right, fb.last_raw_right);
+          fb.last_raw_left = raw_left;
+          fb.last_raw_right = raw_right;
+          fb.left_position = -static_cast<double>(fb.accumulated_left) * kRadPerEncoderCount;
+          fb.right_position = static_cast<double>(fb.accumulated_right) * kRadPerEncoderCount;
+        }
+      }
+    }
+  }
+
+  void shutdown()
+  {
+    if (socket_ < 0) {
+      return;
+    }
+    command_current(0.0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    sdo_write_u16(0x6040, 0x00, 0x0006);
+  }
+
+private:
+  void send_frame(uint32_t can_id, const uint8_t * data, size_t size)
+  {
+    struct can_frame frame {};
+    frame.can_id = can_id;
+    frame.can_dlc = static_cast<__u8>(size);
+    std::memcpy(frame.data, data, size);
+    if (::write(socket_, &frame, sizeof(frame)) <= 0) {
+      throw std::runtime_error("CAN write failed");
+    }
+  }
+
+  void send_pdo(uint32_t can_id, uint32_t payload)
+  {
+    uint8_t bytes[4]{};
+    std::memcpy(bytes, &payload, sizeof(payload));
+    send_frame(can_id, bytes, sizeof(bytes));
+  }
+
+  void nmt(uint8_t command)
+  {
+    const uint8_t data[2] = {command, static_cast<uint8_t>(node_id_)};
+    send_frame(0x000, data, 2);
+  }
+
+  void sdo_write(uint16_t index, uint8_t subindex, uint32_t value, int bytes)
+  {
+    uint8_t command = 0x23;
+    if (bytes == 1) {
+      command = 0x2F;
+    } else if (bytes == 2) {
+      command = 0x2B;
+    } else if (bytes != 4) {
+      throw std::runtime_error("Unsupported SDO write size");
+    }
+
+    uint8_t data[8]{};
+    data[0] = command;
+    data[1] = static_cast<uint8_t>(index & 0xFFu);
+    data[2] = static_cast<uint8_t>((index >> 8) & 0xFFu);
+    data[3] = subindex;
+    std::memcpy(&data[4], &value, static_cast<size_t>(bytes));
+    send_frame(0x600u + node_id_, data, 8);
+    wait_sdo_ack(index, subindex);
+  }
+
+  void sdo_write_u8(uint16_t index, uint8_t subindex, uint8_t value)
+  {
+    sdo_write(index, subindex, value, 1);
+  }
+
+  void sdo_write_u16(uint16_t index, uint8_t subindex, uint16_t value)
+  {
+    sdo_write(index, subindex, value, 2);
+  }
+
+  void sdo_write_u32(uint16_t index, uint8_t subindex, uint32_t value)
+  {
+    sdo_write(index, subindex, value, 4);
+  }
+
+  void wait_sdo_ack(uint16_t index, uint8_t subindex)
+  {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+    while (std::chrono::steady_clock::now() < deadline) {
+      struct pollfd pfd {};
+      pfd.fd = socket_;
+      pfd.events = POLLIN;
+      const int rc = poll(&pfd, 1, 20);
+      if (rc <= 0) {
+        continue;
+      }
+
+      struct can_frame frame {};
+      while (::read(socket_, &frame, sizeof(frame)) > 0) {
+        if (frame.can_id != 0x580u + node_id_ || frame.can_dlc < 4) {
+          continue;
+        }
+        const uint16_t response_index =
+          static_cast<uint16_t>(frame.data[1]) |
+          (static_cast<uint16_t>(frame.data[2]) << 8);
+        if (response_index != index || frame.data[3] != subindex) {
+          continue;
+        }
+        if (frame.data[0] == 0x60) {
+          return;
+        }
+        if (frame.data[0] == 0x80 && frame.can_dlc >= 8) {
+          uint32_t abort_code = 0;
+          std::memcpy(&abort_code, &frame.data[4], sizeof(abort_code));
+          std::ostringstream oss;
+          oss << "SDO abort 0x" << std::hex << abort_code
+              << " at 0x" << index << ":" << std::dec << static_cast<int>(subindex);
+          throw std::runtime_error(oss.str());
+        }
+      }
+    }
+    std::ostringstream oss;
+    oss << "SDO timeout at 0x" << std::hex << index
+        << ":" << std::dec << static_cast<int>(subindex);
+    throw std::runtime_error(oss.str());
+  }
+
+  void configure_feedback_pdos()
+  {
+    // These mappings were verified on the actual ZLAC8015D/firmware.
+    // Important: 606Ch:03 and 6077h:03 read back as zero on this unit,
+    // while the individual :01/:02 objects update correctly.
+
+    // TPDO0 (0x180 + node):
+    //   606Ch:01 left actual velocity  I32, 0.1 rpm
+    //   606Ch:02 right actual velocity I32, 0.1 rpm
+    // Total = 64 bit = 8 bytes.
+    const uint32_t tpdo0_cob = 0x180u + static_cast<uint32_t>(node_id_);
+    sdo_write_u32(0x1800, 0x01, 0x80000000u | tpdo0_cob);  // disable
+    sdo_write_u8(0x1A00, 0x00, 0);
+    sdo_write_u32(0x1A00, 0x01, 0x606C0120u);
+    sdo_write_u32(0x1A00, 0x02, 0x606C0220u);
+    sdo_write_u8(0x1800, 0x02, 0xFF);  // asynchronous/event timer
+    sdo_write_u16(0x1800, 0x03, 0);    // no inhibit; verified working
+    sdo_write_u16(0x1800, 0x05, 10);   // 10 * 500 us = 5 ms = 200 Hz
+    sdo_write_u8(0x1A00, 0x00, 2);
+    sdo_write_u32(0x1800, 0x01, tpdo0_cob);  // enable
+
+    // TPDO1 (0x280 + node):
+    //   6077h:01 left actual current  I16, 0.1 A
+    //   6077h:02 right actual current I16, 0.1 A
+    // Total = 32 bit = 4 bytes.
+    const uint32_t tpdo1_cob = 0x280u + static_cast<uint32_t>(node_id_);
+    sdo_write_u32(0x1801, 0x01, 0x80000000u | tpdo1_cob);  // disable
+    sdo_write_u8(0x1A01, 0x00, 0);
+    sdo_write_u32(0x1A01, 0x01, 0x60770110u);
+    sdo_write_u32(0x1A01, 0x02, 0x60770210u);
+    sdo_write_u8(0x1801, 0x02, 0xFF);
+    sdo_write_u16(0x1801, 0x03, 0);
+    sdo_write_u16(0x1801, 0x05, 10);   // 5 ms = 200 Hz
+    sdo_write_u8(0x1A01, 0x00, 2);
+    sdo_write_u32(0x1801, 0x01, tpdo1_cob);  // enable
+
+    // TPDO2 (0x380 + node): 6064h:01/:02 actual positions, 20 ms.
+    // Keep position feedback separate from the 200-Hz LADRC feedback path.
+    const uint32_t tpdo2_cob = 0x380u + static_cast<uint32_t>(node_id_);
+    sdo_write_u32(0x1802, 0x01, 0x80000000u | tpdo2_cob);  // disable
+    sdo_write_u8(0x1A02, 0x00, 0);
+    sdo_write_u32(0x1A02, 0x01, 0x60640120u);
+    sdo_write_u32(0x1A02, 0x02, 0x60640220u);
+    sdo_write_u8(0x1802, 0x02, 0xFF);
+    sdo_write_u16(0x1802, 0x03, 0);
+    sdo_write_u16(0x1802, 0x05, 40);   // 40 * 500 us = 20 ms
+    sdo_write_u8(0x1A02, 0x00, 2);
+    sdo_write_u32(0x1802, 0x01, tpdo2_cob);  // enable
+  }
+
+  void configure_torque_rpdo()
+  {
+    // RPDO1 (0x300 + node): use the individual target-current objects.
+    // The actual driver was verified with 6071h:02 SDO writes; do not rely
+    // on the :03 combined object.
+    //   bytes 0..1 -> 6071h:01 left target current  I16 [mA]
+    //   bytes 2..3 -> 6071h:02 right target current I16 [mA]
+    const uint32_t rpdo1_cob = 0x300u + static_cast<uint32_t>(node_id_);
+    sdo_write_u32(0x1401, 0x01, 0x80000000u | rpdo1_cob);  // disable
+    sdo_write_u8(0x1601, 0x00, 0);
+    sdo_write_u32(0x1601, 0x01, 0x60710110u);
+    sdo_write_u32(0x1601, 0x02, 0x60710210u);
+    sdo_write_u8(0x1401, 0x02, 0xFF);
+    sdo_write_u8(0x1601, 0x00, 2);
+    sdo_write_u32(0x1401, 0x01, rpdo1_cob);  // enable
+  }
+
+  std::string interface_name_;
+  int node_id_{1};
+  int socket_{-1};
+};
+
+void log_row(
+  std::ofstream & csv,
+  const std::chrono::steady_clock::time_point & program_start,
+  int trial,
+  const std::string & phase,
+  double phase_time_s,
+  double target_current_a,
+  const Feedback & fb)
+{
+  const double host_time_s = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - program_start).count();
+
+  csv << std::fixed << std::setprecision(9)
+      << host_time_s << ','
+      << trial << ','
+      << phase << ','
+      << phase_time_s << ','
+      << target_current_a << ','
+      << target_current_a << ','
+      << target_current_a << ','
+      << fb.left_current << ','
+      << fb.right_current << ','
+      << fb.left_velocity << ','
+      << fb.right_velocity << ','
+      << fb.left_position << ','
+      << fb.right_position << '\n';
+}
+
+void run_phase(
+  ZlacCan & can,
+  Feedback & fb,
+  std::ofstream & csv,
+  const std::chrono::steady_clock::time_point & program_start,
+  int trial,
+  const std::string & phase,
+  double target_current_a,
+  double duration_s,
+  double sample_hz)
+{
+  const auto period = std::chrono::duration<double>(1.0 / sample_hz);
+
+  // Change the current command only at the phase edge.  The identification
+  // program intentionally uses SDO for target current, while the 200-Hz loop
+  // below is receive/log only.  Repeating SDO writes at 200 Hz would destroy
+  // the intended sampling timing and is unnecessary because 6071h holds its
+  // value until changed.
+  can.command_current(target_current_a);
+
+  const auto phase_start = std::chrono::steady_clock::now();
+  auto next_tick = phase_start;
+
+  while (g_keep_running.load()) {
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed = std::chrono::duration<double>(now - phase_start).count();
+    if (elapsed >= duration_s) {
+      break;
+    }
+
+    can.drain_feedback(fb);
+    log_row(csv, program_start, trial, phase, elapsed, target_current_a, fb);
+
+    next_tick += std::chrono::duration_cast<std::chrono::steady_clock::duration>(period);
+    std::this_thread::sleep_until(next_tick);
+  }
+}
+
+bool wait_until_stopped(
+  ZlacCan & can,
+  Feedback & fb,
+  std::ofstream & csv,
+  const std::chrono::steady_clock::time_point & program_start,
+  int trial,
+  double sample_hz,
+  double threshold_rad_s,
+  double hold_s,
+  double timeout_s)
+{
+  const auto period = std::chrono::duration<double>(1.0 / sample_hz);
+  can.command_current(0.0);
+
+  const auto phase_start = std::chrono::steady_clock::now();
+  auto next_tick = phase_start;
+  bool below_active = false;
+  std::chrono::steady_clock::time_point below_since{};
+
+  while (g_keep_running.load()) {
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed =
+      std::chrono::duration<double>(now - phase_start).count();
+
+    can.drain_feedback(fb);
+    log_row(csv, program_start, trial, "wait_stop", elapsed, 0.0, fb);
+
+    if (fb.velocity_valid) {
+      const bool below =
+        std::abs(fb.left_velocity) <= threshold_rad_s &&
+        std::abs(fb.right_velocity) <= threshold_rad_s;
+
+      if (below) {
+        if (!below_active) {
+          below_active = true;
+          below_since = now;
+        }
+        const double held =
+          std::chrono::duration<double>(now - below_since).count();
+        if (held >= hold_s) {
+          return true;
+        }
+      } else {
+        below_active = false;
+      }
+    }
+
+    if (elapsed >= timeout_s) {
+      return false;
+    }
+
+    next_tick += std::chrono::duration_cast<std::chrono::steady_clock::duration>(period);
+    std::this_thread::sleep_until(next_tick);
+  }
+  return false;
+}
+
+std::vector<double> build_test_sequence(const Options & opt)
+{
+  std::vector<double> sequence;
+  sequence.reserve(
+    static_cast<size_t>(opt.repeats) * opt.currents_a.size() *
+    (opt.bidirectional ? 2u : 1u));
+
+  for (int repeat = 0; repeat < opt.repeats; ++repeat) {
+    for (double magnitude : opt.currents_a) {
+      if (!opt.bidirectional) {
+        sequence.push_back(magnitude);
+        continue;
+      }
+
+      // Reverse the order every repeat to reduce order/thermal bias.
+      if ((repeat % 2) == 0) {
+        sequence.push_back(+magnitude);
+        sequence.push_back(-magnitude);
+      } else {
+        sequence.push_back(-magnitude);
+        sequence.push_back(+magnitude);
+      }
+    }
+  }
+  return sequence;
+}
+
+}  // namespace
+
+int main(int argc, char ** argv)
+{
+  try {
+    const Options opt = parse_options(argc, argv);
+    if (!opt.run) {
+      print_usage(argv[0]);
+      std::cerr << "\nRefusing to command motors without --run.\n";
+      return 2;
+    }
+
+    std::signal(SIGINT, signal_handler);
+    std::signal(SIGTERM, signal_handler);
+
+    const std::vector<double> test_sequence = build_test_sequence(opt);
+
+    std::ofstream csv(opt.output);
+    if (!csv) {
+      throw std::runtime_error("Cannot open output CSV: " + opt.output);
+    }
+    csv << "host_time_s,trial,phase,phase_time_s,target_current_A,"
+        << "left_cmd_A,right_cmd_A,left_actual_A,right_actual_A,"
+        << "left_omega_rad_s,right_omega_rad_s,left_position_rad,right_position_rad\n";
+
+    std::cout << "b0 identification v4 will MOVE the robot.\n"
+              << "CAN=" << opt.can_interface
+              << " node=" << opt.node_id
+              << " sample=" << opt.sample_hz << " Hz"
+              << " pulse=" << opt.pulse_s << " s"
+              << " stop_threshold=" << opt.stop_threshold_rad_s << " rad/s"
+              << " stop_hold=" << opt.stop_hold_s << " s"
+              << " stop_timeout=" << opt.stop_timeout_s << " s"
+              << " output=" << opt.output << "\n";
+    std::cout << "Trial sequence [A]:";
+    for (double current : test_sequence) {
+      std::cout << ' ' << current;
+    }
+    std::cout << "\nStarting in 3 seconds. Ctrl-C aborts and commands zero current.\n";
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+
+    ZlacCan can(opt.can_interface, opt.node_id);
+    can.open_socket();
+    can.configure_for_identification();
+
+    Feedback fb;
+    const auto program_start = std::chrono::steady_clock::now();
+
+    // Wait for initial TPDO reception and an actually stopped state.
+    std::cout << "Initial stop check...\n";
+    if (!wait_until_stopped(
+        can, fb, csv, program_start, 0, opt.sample_hz,
+        opt.stop_threshold_rad_s, opt.stop_hold_s, opt.stop_timeout_s))
+    {
+      throw std::runtime_error(
+        "Initial stop condition was not reached before timeout. "
+        "No identification pulse was applied.");
+    }
+
+    if (!fb.velocity_valid || !fb.current_valid) {
+      throw std::runtime_error(
+        "Velocity/current TPDO feedback was not received. Check PDO mapping and CAN setup.");
+    }
+
+    int trial = 0;
+    int skipped = 0;
+
+    for (double current : test_sequence) {
+      if (!g_keep_running.load()) {
+        break;
+      }
+      ++trial;
+
+      std::cout << "Trial " << trial << "/" << test_sequence.size()
+                << ": target " << current << " A; waiting for stop...\n";
+
+      const bool stopped = wait_until_stopped(
+        can, fb, csv, program_start, trial, opt.sample_hz,
+        opt.stop_threshold_rad_s, opt.stop_hold_s, opt.stop_timeout_s);
+
+      if (!stopped) {
+        ++skipped;
+        std::cerr << "  SKIP: stop condition not reached within "
+                  << opt.stop_timeout_s << " s"
+                  << " (last omega L=" << fb.left_velocity
+                  << ", R=" << fb.right_velocity << " rad/s).\n";
+        csv.flush();
+        continue;
+      }
+
+      std::cout << "  stopped: omega L=" << fb.left_velocity
+                << ", R=" << fb.right_velocity
+                << " rad/s -> pulse\n";
+
+      run_phase(
+        can, fb, csv, program_start, trial, "pulse",
+        current, opt.pulse_s, opt.sample_hz);
+
+      can.command_current(0.0);
+      csv.flush();
+    }
+
+    can.command_current(0.0);
+    can.shutdown();
+    csv.flush();
+
+    std::cout << "Finished. CSV written to " << opt.output << "\n"
+              << "Trials requested=" << trial
+              << ", skipped_for_stop=" << skipped << "\n"
+              << "Run analyze_b0.py on this CSV for the global b0 fit.\n";
+    return g_keep_running.load() ? 0 : 130;
+  } catch (const std::exception & e) {
+    std::cerr << "ERROR: " << e.what() << '\n';
+    return 1;
+  }
+}

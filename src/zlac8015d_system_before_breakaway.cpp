@@ -13,8 +13,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <fstream>
-#include <iomanip>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -234,27 +232,10 @@ hardware_interface::CallbackReturn Zlac8015dSystemHardware::on_activate(
   left_ladrc_.z2 = 0.0;
   left_ladrc_.last_current_cmd = 0.0;
   left_ladrc_.initialized = false;
-  left_ladrc_.tracking = false;
-  left_ladrc_.start_count = 0;
-  left_ladrc_.stall_count = 0;
-  left_ladrc_.breakaway_count = 0;
-  left_ladrc_.breakaway_target = 0.65;
-  left_ladrc_.track_hold_count = 0;
-  left_ladrc_.track_hold_start = 0.20;
-  left_ladrc_.direction_sign = 0;
-
   right_ladrc_.z1 = 0.0;
   right_ladrc_.z2 = 0.0;
   right_ladrc_.last_current_cmd = 0.0;
   right_ladrc_.initialized = false;
-  right_ladrc_.tracking = false;
-  right_ladrc_.start_count = 0;
-  right_ladrc_.stall_count = 0;
-  right_ladrc_.breakaway_count = 0;
-  right_ladrc_.breakaway_target = 0.65;
-  right_ladrc_.track_hold_count = 0;
-  right_ladrc_.track_hold_start = 0.20;
-  right_ladrc_.direction_sign = 0;
 
   const uint32_t sdo_id = 0x600u + node_id_;
 
@@ -548,140 +529,15 @@ hardware_interface::return_type Zlac8015dSystemHardware::write(
   // Protect the explicit Euler observer from a large scheduler hiccup.
   dt = clamp(dt, 0.001, 0.020);
 
-  // LESO input: previous-cycle commanded current.
-  // This defines the LADRC plant input as the current command sent
-  // to the motor driver. Current-loop dynamics and command/actual
-  // current mismatch are then absorbed into z2 as total disturbance.
   const double current_l_measured =
-    left_ladrc_.last_current_cmd;
+    current_feedback_received_ ? hw_efforts_[0] : left_ladrc_.last_current_cmd;
   const double current_r_measured =
-    right_ladrc_.last_current_cmd;
+    current_feedback_received_ ? hw_efforts_[1] : right_ladrc_.last_current_cmd;
 
-  // ----------------------------------------------------------
-  // Coordinated BREAKAWAY for near-pure in-place turns.
-  //
-  // Enable only when the wheel references are opposite and
-  // approximately equal in magnitude.
-  // Normal curves remain independently controlled.
-  // ----------------------------------------------------------
-  constexpr double INPLACE_SUM_TOL_RAD_S = 0.05;
-
-  const bool coordinated_turn =
-    (hw_commands_[0] * hw_commands_[1] < 0.0) &&
-    (std::abs(hw_commands_[0] + hw_commands_[1]) <=
-     INPLACE_SUM_TOL_RAD_S);
-
-  const bool allow_independent_track =
-    !coordinated_turn;
-
-  double cmd_current_l = compute_ladrc_current(
-    left_ladrc_,
-    hw_commands_[0],
-    hw_velocities_[0],
-    current_l_measured,
-    dt,
-    allow_independent_track);
-
-  double cmd_current_r = compute_ladrc_current(
-    right_ladrc_,
-    hw_commands_[1],
-    hw_velocities_[1],
-    current_r_measured,
-    dt,
-    allow_independent_track);
-
-  // 0.30 rad/s for 100 ms = 20 samples @ 200 Hz.
-  constexpr int COORDINATED_START_SAMPLES = 20;
-  constexpr double COORDINATED_BREAKAWAY_START_A = 0.65;
-
-  // ----------------------------------------------------------
-  // BREAKAWAY -> TRACK:
-  // both wheels must satisfy the start condition.
-  // ----------------------------------------------------------
-  if (coordinated_turn &&
-      !left_ladrc_.tracking &&
-      !right_ladrc_.tracking &&
-      left_ladrc_.start_count >= COORDINATED_START_SAMPLES &&
-      right_ladrc_.start_count >= COORDINATED_START_SAMPLES)
-  {
-    left_ladrc_.tracking = true;
-    right_ladrc_.tracking = true;
-
-    left_ladrc_.stall_count = 0;
-    right_ladrc_.stall_count = 0;
-
-    left_ladrc_.track_hold_count = 0;
-    right_ladrc_.track_hold_count = 0;
-
-    left_ladrc_.track_hold_start =
-      left_ladrc_.breakaway_target;
-    right_ladrc_.track_hold_start =
-      right_ladrc_.breakaway_target;
-
-    left_ladrc_.z1 = hw_velocities_[0];
-    right_ladrc_.z1 = hw_velocities_[1];
-
-    left_ladrc_.z2 = 0.0;
-    right_ladrc_.z2 = 0.0;
-
-    left_ladrc_.initialized = true;
-    right_ladrc_.initialized = true;
-  }
-
-  // ----------------------------------------------------------
-  // TRACK -> BREAKAWAY:
-  // if only one wheel stalls during an in-place turn,
-  // force both wheels back to BREAKAWAY together.
-  // ----------------------------------------------------------
-  if (coordinated_turn &&
-      (left_ladrc_.tracking != right_ladrc_.tracking))
-  {
-    auto reset_to_breakaway =
-      [](LadrcState & state,
-         const double velocity_measured,
-         const int direction)
-      {
-        state.tracking = false;
-
-        state.start_count = 0;
-        state.stall_count = 0;
-
-        state.breakaway_count = 0;
-        state.breakaway_target =
-          COORDINATED_BREAKAWAY_START_A;
-
-        state.track_hold_count = 0;
-        state.track_hold_start = 0.20;
-
-        state.z1 = velocity_measured;
-        state.z2 = 0.0;
-        state.initialized = true;
-
-        state.last_current_cmd =
-          static_cast<double>(direction) *
-          COORDINATED_BREAKAWAY_START_A;
-      };
-
-    const int direction_l =
-      hw_commands_[0] >= 0.0 ? +1 : -1;
-
-    const int direction_r =
-      hw_commands_[1] >= 0.0 ? +1 : -1;
-
-    reset_to_breakaway(
-      left_ladrc_, hw_velocities_[0], direction_l);
-
-    reset_to_breakaway(
-      right_ladrc_, hw_velocities_[1], direction_r);
-
-    cmd_current_l =
-      static_cast<double>(direction_l) *
-      COORDINATED_BREAKAWAY_START_A;
-
-    cmd_current_r =
-      static_cast<double>(direction_r) *
-      COORDINATED_BREAKAWAY_START_A;
-  }
+  const double cmd_current_l = compute_ladrc_current(
+    left_ladrc_, hw_commands_[0], hw_velocities_[0], current_l_measured, dt);
+  const double cmd_current_r = compute_ladrc_current(
+    right_ladrc_, hw_commands_[1], hw_velocities_[1], current_r_measured, dt);
 
   // ZLAC command convention on this robot: left sign is opposite to ROS-forward.
   const int16_t cmd_l_ma = static_cast<int16_t>(
@@ -701,82 +557,14 @@ hardware_interface::return_type Zlac8015dSystemHardware::write(
     return hardware_interface::return_type::ERROR;
   }
 
-  // ==========================================================
-  // 200 Hz LADRC runtime CSV logger
-  // ==========================================================
-  static std::ofstream csv_log;
-  static bool csv_initialized = false;
-  static std::chrono::steady_clock::time_point csv_start_time;
-  static int csv_flush_count = 0;
-
-  if (!csv_initialized) {
-    csv_log.open(
-      "/tmp/ladrc_track_200hz.csv",
-      std::ios::out | std::ios::trunc);
-
-    if (csv_log.is_open()) {
-      csv_log
-        << "time_s,"
-        << "ref_left_rad_s,ref_right_rad_s,"
-        << "vel_left_rad_s,vel_right_rad_s,"
-        << "pos_left_rad,pos_right_rad,"
-        << "cmd_current_left_A,cmd_current_right_A,"
-        << "actual_current_left_A,actual_current_right_A,"
-        << "z1_left,z1_right,"
-        << "z2_left,z2_right,"
-        << "tracking_left,tracking_right,"
-        << "breakaway_target_left_A,breakaway_target_right_A"
-        << '\n';
-
-      csv_log << std::setprecision(10);
-      csv_start_time = std::chrono::steady_clock::now();
-    }
-
-    csv_initialized = true;
-  }
-
-  if (csv_log.is_open()) {
-    const double csv_time_s =
-      std::chrono::duration<double>(
-        std::chrono::steady_clock::now() -
-        csv_start_time).count();
-
-    csv_log
-      << csv_time_s << ","
-      << hw_commands_[0] << ","
-      << hw_commands_[1] << ","
-      << hw_velocities_[0] << ","
-      << hw_velocities_[1] << ","
-      << hw_positions_[0] << ","
-      << hw_positions_[1] << ","
-      << cmd_current_l << ","
-      << cmd_current_r << ","
-      << current_l_measured << ","
-      << current_r_measured << ","
-      << left_ladrc_.z1 << ","
-      << right_ladrc_.z1 << ","
-      << left_ladrc_.z2 << ","
-      << right_ladrc_.z2 << ","
-      << static_cast<int>(left_ladrc_.tracking) << ","
-      << static_cast<int>(right_ladrc_.tracking) << ","
-      << left_ladrc_.breakaway_target << ","
-      << right_ladrc_.breakaway_target
-      << '\n';
-
-    if (++csv_flush_count % 200 == 0) {
-      csv_log.flush();
-    }
-  }
-
   static int debug_count = 0;
   if (++debug_count % 200 == 0) {
     RCLCPP_INFO(
       rclcpp::get_logger("Zlac8015dSystemHardware"),
-      "LADRC ref[L,R]=[%.2f, %.2f] rad/s vel=[%.2f, %.2f] A_cmd=[%.2f, %.2f] A_actual=[%.2f, %.2f] z2=[%.2f, %.2f]",
+      "LADRC ref[L,R]=[%.2f, %.2f] rad/s vel=[%.2f, %.2f] A_cmd=[%.2f, %.2f] z2=[%.2f, %.2f]",
       hw_commands_[0], hw_commands_[1],
       hw_velocities_[0], hw_velocities_[1],
       cmd_current_l, cmd_current_r,
-      current_l_measured, current_r_measured,
       left_ladrc_.z2, right_ladrc_.z2);
   }
 
@@ -788,203 +576,8 @@ double Zlac8015dSystemHardware::compute_ladrc_current(
   const double velocity_reference,
   const double velocity_measured,
   const double current_measured,
-  const double dt,
-  const bool allow_track_transition)
+  const double dt)
 {
-  // ==========================================================
-  // Tuned normal-ground LADRC
-  //
-  // b0   = supplied by URDF (20)
-  // wc   = 5 rad/s
-  // wo   = 20 rad/s
-  // Imax = 0.7 A
-  //
-  // BREAKAWAY:
-  //   0.65 A start
-  //   +0.05 A every 200 ms
-  //   max 1.0 A
-  //
-  // BREAKAWAY -> TRACK:
-  //   |omega| >= 0.30 rad/s for 100 ms
-  //
-  // TRACK -> BREAKAWAY:
-  //   |omega| < 0.10 rad/s for 100 ms
-  //
-  // TRACK_HOLD:
-  //   300 ms
-  //   previous BREAKAWAY current -> 0.20 A
-  // ==========================================================
-
-  constexpr double REF_ZERO = 1.0e-6;
-
-  constexpr double BREAKAWAY_START_A = 0.65;
-  constexpr double BREAKAWAY_STEP_A  = 0.10;
-  constexpr double BREAKAWAY_MAX_A   = 8.00;
-
-  // During coordinated in-place BREAKAWAY, a wheel that has
-  // already satisfied the start condition waits at this current
-  // while the other wheel continues its BREAKAWAY ramp.
-  constexpr double READY_WAIT_A      = 1.00;
-
-  constexpr int BREAKAWAY_STEP_SAMPLES = 40;  // 200 ms @ 200 Hz
-
-  constexpr double START_SPEED_RAD_S = 0.30;
-  constexpr int START_SAMPLES = 20;            // 100 ms @ 200 Hz
-
-  constexpr double STALL_SPEED_RAD_S = 0.10;
-  constexpr int STALL_SAMPLES = 20;            // 100 ms @ 200 Hz
-
-  constexpr int TRACK_HOLD_SAMPLES = 60;       // 300 ms @ 200 Hz
-  constexpr double TRACK_FLOOR_A = 0.20;
-
-
-  // ----------------------------------------------------------
-  // Zero velocity reference:
-  // stop current and reset the state machine.
-  // ----------------------------------------------------------
-
-  if (std::abs(velocity_reference) <= REF_ZERO) {
-    state.z1 = velocity_measured;
-    state.z2 = 0.0;
-    state.last_current_cmd = 0.0;
-    state.initialized = false;
-
-    state.tracking = false;
-    state.start_count = 0;
-    state.stall_count = 0;
-
-    state.breakaway_count = 0;
-    state.breakaway_target = BREAKAWAY_START_A;
-
-    state.track_hold_count = 0;
-    state.track_hold_start = TRACK_FLOOR_A;
-
-    state.direction_sign = 0;
-
-    return 0.0;
-  }
-
-
-  const int direction =
-    velocity_reference >= 0.0 ? +1 : -1;
-
-  const double speed_in_command_direction =
-    static_cast<double>(direction) * velocity_measured;
-
-
-  // ----------------------------------------------------------
-  // Direction reversal:
-  // restart from BREAKAWAY.
-  // ----------------------------------------------------------
-
-  if (state.direction_sign != 0 &&
-      state.direction_sign != direction)
-  {
-    state.z1 = velocity_measured;
-    state.z2 = 0.0;
-    state.last_current_cmd = 0.0;
-    state.initialized = false;
-
-    state.tracking = false;
-    state.start_count = 0;
-    state.stall_count = 0;
-
-    state.breakaway_count = 0;
-    state.breakaway_target = BREAKAWAY_START_A;
-
-    state.track_hold_count = 0;
-    state.track_hold_start = TRACK_FLOOR_A;
-  }
-
-  state.direction_sign = direction;
-
-
-  // ==========================================================
-  // BREAKAWAY
-  // ==========================================================
-
-  if (!state.tracking) {
-
-    // Freeze/reset ESO during BREAKAWAY.
-    state.z1 = velocity_measured;
-    state.z2 = 0.0;
-    state.initialized = true;
-
-    // Require sustained rotation before entering TRACK.
-    if (speed_in_command_direction >= START_SPEED_RAD_S) {
-      ++state.start_count;
-    } else {
-      state.start_count = 0;
-    }
-
-    // During coordinated in-place BREAKAWAY, once this wheel
-    // has satisfied the start condition, hold its BREAKAWAY
-    // current instead of continuing to ramp upward.
-    //
-    // If the wheel falls below the start-speed condition again,
-    // start_count resets and the current ramp resumes.
-    const bool coordinated_ready =
-      (!allow_track_transition &&
-       state.start_count >= START_SAMPLES);
-
-    // A wheel that becomes READY must not keep the large
-    // BREAKAWAY current that was required to overcome static
-    // friction. Reduce it immediately to the waiting current.
-    //
-    // If the wheel subsequently falls below START_SPEED_RAD_S,
-    // start_count resets to zero and the BREAKAWAY ramp resumes
-    // from READY_WAIT_A.
-    if (coordinated_ready) {
-      state.breakaway_target =
-        std::min(state.breakaway_target, READY_WAIT_A);
-    }
-
-    // Increase target by 0.05 A every 200 ms only while
-    // this wheel is not yet ready.
-    if (!coordinated_ready &&
-        state.breakaway_count > 0 &&
-        state.breakaway_count % BREAKAWAY_STEP_SAMPLES == 0)
-    {
-      state.breakaway_target = clamp(
-        state.breakaway_target + BREAKAWAY_STEP_A,
-        BREAKAWAY_START_A,
-        BREAKAWAY_MAX_A);
-    }
-
-    ++state.breakaway_count;
-
-
-    const double breakaway_current =
-      static_cast<double>(direction) *
-      state.breakaway_target;
-
-    state.last_current_cmd = breakaway_current;
-
-
-    if (allow_track_transition &&
-        state.start_count >= START_SAMPLES) {
-
-      state.tracking = true;
-      state.stall_count = 0;
-
-      state.track_hold_count = 0;
-      state.track_hold_start =
-        state.breakaway_target;
-
-      // Start TRACK observer from the measured state.
-      state.z1 = velocity_measured;
-      state.z2 = 0.0;
-      state.initialized = true;
-    }
-
-    return breakaway_current;
-  }
-
-
-  // ==========================================================
-  // TRACK: LESO
-  // ==========================================================
-
   if (!state.initialized) {
     state.z1 = velocity_measured;
     state.z2 = 0.0;
@@ -992,135 +585,31 @@ double Zlac8015dSystemHardware::compute_ladrc_current(
     state.initialized = true;
   }
 
-  const double observer_error =
-    velocity_measured - state.z1;
+  const double observer_error = velocity_measured - state.z1;
+  const double beta1 = 2.0 * observer_bandwidth_;
+  const double beta2 = observer_bandwidth_ * observer_bandwidth_;
 
-  const double beta1 =
-    2.0 * observer_bandwidth_;
-
-  const double beta2 =
-    observer_bandwidth_ * observer_bandwidth_;
-
+  // Explicit-Euler LESO for: omega_dot = f + b0 * I.
   const double z1_dot =
-    state.z2 +
-    state.b0 * current_measured +
-    beta1 * observer_error;
-
-  const double z2_dot =
-    beta2 * observer_error;
-
+    state.z2 + state.b0 * current_measured + beta1 * observer_error;
+  const double z2_dot = beta2 * observer_error;
   state.z1 += dt * z1_dot;
   state.z2 += dt * z2_dot;
 
-
-  // ==========================================================
-  // TRACK: LADRC
-  // ==========================================================
-
   const double desired_acceleration =
-    controller_bandwidth_ *
-    (velocity_reference - state.z1);
-
+    controller_bandwidth_ * (velocity_reference - state.z1);
   double current_command =
-    (desired_acceleration - state.z2) /
-    state.b0;
+    (desired_acceleration - state.z2) / state.b0;
 
+  current_command = clamp(current_command, -current_limit_a_, current_limit_a_);
 
-  // TRACK Imax
-  current_command = clamp(
-    current_command,
-    -current_limit_a_,
-    +current_limit_a_);
-
-
-  // 20 A/s software slew-rate limit
-  const double max_delta_current =
-    current_rate_limit_a_per_s_ * dt;
-
+  const double max_delta_current = current_rate_limit_a_per_s_ * dt;
   current_command = clamp(
     current_command,
     state.last_current_cmd - max_delta_current,
     state.last_current_cmd + max_delta_current);
 
-
-  // ==========================================================
-  // TRACK_HOLD / current floor
-  // ==========================================================
-
-  double floor_a = TRACK_FLOOR_A;
-
-  if (state.track_hold_count < TRACK_HOLD_SAMPLES) {
-
-    const double ratio =
-      static_cast<double>(state.track_hold_count) /
-      static_cast<double>(TRACK_HOLD_SAMPLES);
-
-    floor_a =
-      state.track_hold_start +
-      (TRACK_FLOOR_A - state.track_hold_start) *
-      ratio;
-
-    ++state.track_hold_count;
-  }
-
-
-  // During forward/reverse tracking, keep at least the floor
-  // current in the commanded direction.
-  if (static_cast<double>(direction) *
-      current_command < floor_a)
-  {
-    current_command =
-      static_cast<double>(direction) *
-      floor_a;
-  }
-
-  // Final hard TRACK current limit.
-  //
-  // TRACK_HOLD / floor is applied after the LADRC clamp above,
-  // so it must not be allowed to raise the final command beyond
-  // current_limit_a_.
-  current_command = clamp(
-    current_command,
-    -current_limit_a_,
-    +current_limit_a_);
-
-
-  // ==========================================================
-  // Stall detection
-  // ==========================================================
-
-  if (speed_in_command_direction < STALL_SPEED_RAD_S) {
-    ++state.stall_count;
-  } else {
-    state.stall_count = 0;
-  }
-
-
-  if (state.stall_count >= STALL_SAMPLES) {
-
-    state.tracking = false;
-
-    state.start_count = 0;
-    state.stall_count = 0;
-
-    state.breakaway_count = 0;
-    state.breakaway_target = BREAKAWAY_START_A;
-
-    state.track_hold_count = 0;
-    state.track_hold_start = TRACK_FLOOR_A;
-
-    state.z1 = velocity_measured;
-    state.z2 = 0.0;
-    state.initialized = true;
-
-    current_command =
-      static_cast<double>(direction) *
-      BREAKAWAY_START_A;
-  }
-
-
   state.last_current_cmd = current_command;
-
   return current_command;
 }
 
