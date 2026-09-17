@@ -113,6 +113,20 @@ private:
   std::chrono::steady_clock::time_point last_velocity_feedback_time_{};
   bool feedback_timeout_reported_{false};
 
+  // True while the ZLAC8015D is held in CiA402 Quick Stop state.
+  bool quick_stop_active_{false};
+
+  // True after Quick Stop has reached the first-stop region.
+  // While the wheel references remain zero, keep zero current
+  // without re-entering Quick Stop.
+  bool zero_stop_hold_{false};
+
+  // Normal-stop velocity ramp state.
+  // Normal cmd_vel=0 does NOT use Quick Stop.
+  bool normal_stop_ramp_active_{false};
+  double normal_stop_ref_left_{0.0};
+  double normal_stop_ref_right_{0.0};
+
   // 6064h Position actual value [count]
   int32_t raw_position_left_{0};
   int32_t raw_position_right_{0};

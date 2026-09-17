@@ -311,6 +311,30 @@ hardware_interface::CallbackReturn Zlac8015dSystemHardware::on_activate(
   // 6087h is read-only on the verified driver.
   // Do not write torque slope here.
 
+  // ----------------------------------------------------------
+  // Quick Stop configuration
+  //
+  // 605A:00 = 6
+  //   Emergency deceleration stop, remain in Quick Stop state.
+  //
+  // 6085:01 = 10 ms : left motor
+  // 6085:02 = 10 ms : right motor
+  // ----------------------------------------------------------
+  send_can_frame(
+    sdo_id,
+    {0x2B, 0x5A, 0x60, 0x00, 0x06, 0x00, 0x00, 0x00});
+  sleep_after_sdo();
+
+  send_can_frame(
+    sdo_id,
+    {0x23, 0x85, 0x60, 0x01, 0x0A, 0x00, 0x00, 0x00});
+  sleep_after_sdo();
+
+  send_can_frame(
+    sdo_id,
+    {0x23, 0x85, 0x60, 0x02, 0x0A, 0x00, 0x00, 0x00});
+  sleep_after_sdo();
+
   send_zero_command();
 
   // CiA402 Servo ON: 6040h = 06 -> 07 -> 0F.
@@ -520,6 +544,80 @@ hardware_interface::return_type Zlac8015dSystemHardware::write(
     return hardware_interface::return_type::OK;
   }
 
+  // ==========================================================
+  // 200 Hz LADRC runtime CSV logger
+  //
+  // Called from both normal LADRC operation and Quick Stop.
+  // ==========================================================
+  auto log_ladrc_runtime =
+    [&](const double cmd_current_l,
+        const double cmd_current_r)
+    {
+      static std::ofstream csv_log;
+      static bool csv_initialized = false;
+      static std::chrono::steady_clock::time_point csv_start_time;
+      static int csv_flush_count = 0;
+
+      if (!csv_initialized) {
+        csv_log.open(
+          "/tmp/ladrc_track_200hz.csv",
+          std::ios::out | std::ios::trunc);
+
+        if (csv_log.is_open()) {
+          csv_log
+            << "time_s,"
+            << "ref_left_rad_s,ref_right_rad_s,"
+            << "vel_left_rad_s,vel_right_rad_s,"
+            << "pos_left_rad,pos_right_rad,"
+            << "cmd_current_left_A,cmd_current_right_A,"
+            << "actual_current_left_A,actual_current_right_A,"
+            << "z1_left,z1_right,"
+            << "z2_left,z2_right,"
+            << "tracking_left,tracking_right,"
+            << "breakaway_target_left_A,breakaway_target_right_A"
+            << '\n';
+
+          csv_log << std::setprecision(10);
+          csv_start_time = std::chrono::steady_clock::now();
+        }
+
+        csv_initialized = true;
+      }
+
+      if (csv_log.is_open()) {
+        const double csv_time_s =
+          std::chrono::duration<double>(
+            std::chrono::steady_clock::now() -
+            csv_start_time).count();
+
+        csv_log
+          << csv_time_s << ","
+          << hw_commands_[0] << ","
+          << hw_commands_[1] << ","
+          << hw_velocities_[0] << ","
+          << hw_velocities_[1] << ","
+          << hw_positions_[0] << ","
+          << hw_positions_[1] << ","
+          << cmd_current_l << ","
+          << cmd_current_r << ","
+          << hw_efforts_[0] << ","
+          << hw_efforts_[1] << ","
+          << left_ladrc_.z1 << ","
+          << right_ladrc_.z1 << ","
+          << left_ladrc_.z2 << ","
+          << right_ladrc_.z2 << ","
+          << static_cast<int>(left_ladrc_.tracking) << ","
+          << static_cast<int>(right_ladrc_.tracking) << ","
+          << left_ladrc_.breakaway_target << ","
+          << right_ladrc_.breakaway_target
+          << '\n';
+
+        if (++csv_flush_count % 200 == 0) {
+          csv_log.flush();
+        }
+      }
+    };
+
   // LADRC torque mode requires fresh velocity feedback.
   if (!velocity_feedback_received_) {
     send_zero_command();
@@ -548,6 +646,167 @@ hardware_interface::return_type Zlac8015dSystemHardware::write(
   // Protect the explicit Euler observer from a large scheduler hiccup.
   dt = clamp(dt, 0.001, 0.020);
 
+  // ==========================================================
+  // Normal stop deceleration ramp
+  //
+  // Priority:
+  //   prevent rear lift caused by excessive deceleration.
+  //
+  // Normal cmd_vel=0 is handled here instead of CiA402
+  // Quick Stop.  Quick Stop remains available for emergency use.
+  // ==========================================================
+  constexpr double WHEEL_RADIUS_M = 0.064;
+
+  // Initial safe test value.
+  constexpr double NORMAL_STOP_MAX_DECEL_MPS2 = 1.00;
+
+  constexpr double NORMAL_STOP_MAX_ANG_DECEL_RAD_S2 =
+    NORMAL_STOP_MAX_DECEL_MPS2 / WHEEL_RADIUS_M;
+
+  constexpr double NORMAL_STOP_FINISH_SPEED_RAD_S = 0.50;
+  constexpr double NORMAL_STOP_REF_ZERO = 1.0e-6;
+
+  const bool zero_velocity_command =
+    std::abs(hw_commands_[0]) <= NORMAL_STOP_REF_ZERO &&
+    std::abs(hw_commands_[1]) <= NORMAL_STOP_REF_ZERO;
+
+  double control_ref_l = hw_commands_[0];
+  double control_ref_r = hw_commands_[1];
+
+  auto ramp_toward_zero =
+    [](const double value, const double max_delta)
+    {
+      if (value > max_delta) {
+        return value - max_delta;
+      }
+
+      if (value < -max_delta) {
+        return value + max_delta;
+      }
+
+      return 0.0;
+    };
+
+  if (zero_velocity_command) {
+
+    // ========================================================
+    // ZERO HOLD
+    //
+    // Once normal stopping has completed, do not restart the
+    // stop ramp while the external velocity command remains zero.
+    // ========================================================
+    if (zero_stop_hold_) {
+
+      normal_stop_ramp_active_ = false;
+
+      normal_stop_ref_left_ = 0.0;
+      normal_stop_ref_right_ = 0.0;
+
+      control_ref_l = 0.0;
+      control_ref_r = 0.0;
+    }
+    else {
+
+      // Start normal stopping only once for each
+      // nonzero -> zero command transition.
+      if (!normal_stop_ramp_active_) {
+
+        normal_stop_ramp_active_ = true;
+
+        normal_stop_ref_left_ = hw_velocities_[0];
+        normal_stop_ref_right_ = hw_velocities_[1];
+
+        RCLCPP_INFO(
+          rclcpp::get_logger("Zlac8015dSystemHardware"),
+          "Normal stop ramp started: vel=[%.3f, %.3f] rad/s, amax=%.3f m/s^2.",
+          hw_velocities_[0],
+          hw_velocities_[1],
+          NORMAL_STOP_MAX_DECEL_MPS2);
+      }
+
+      const double max_delta =
+        NORMAL_STOP_MAX_ANG_DECEL_RAD_S2 * dt;
+
+      normal_stop_ref_left_ =
+        ramp_toward_zero(
+          normal_stop_ref_left_,
+          max_delta);
+
+      normal_stop_ref_right_ =
+        ramp_toward_zero(
+          normal_stop_ref_right_,
+          max_delta);
+
+      // Keep a small reference until the measured wheel speed
+      // also enters the final low-speed region.
+      if (std::abs(normal_stop_ref_left_) <
+            NORMAL_STOP_FINISH_SPEED_RAD_S &&
+          std::abs(hw_velocities_[0]) >
+            NORMAL_STOP_FINISH_SPEED_RAD_S)
+      {
+        normal_stop_ref_left_ =
+          std::copysign(
+            NORMAL_STOP_FINISH_SPEED_RAD_S,
+            hw_velocities_[0]);
+      }
+
+      if (std::abs(normal_stop_ref_right_) <
+            NORMAL_STOP_FINISH_SPEED_RAD_S &&
+          std::abs(hw_velocities_[1]) >
+            NORMAL_STOP_FINISH_SPEED_RAD_S)
+      {
+        normal_stop_ref_right_ =
+          std::copysign(
+            NORMAL_STOP_FINISH_SPEED_RAD_S,
+            hw_velocities_[1]);
+      }
+
+      control_ref_l = normal_stop_ref_left_;
+      control_ref_r = normal_stop_ref_right_;
+
+      // ------------------------------------------------------
+      // End controlled braking before crossing zero.
+      //
+      // 0.50 rad/s * 0.064 m = 0.032 m/s.
+      //
+      // At this low speed, stop the acceleration feedforward
+      // and enter a latched zero-current state.
+      // ------------------------------------------------------
+      if (std::abs(hw_velocities_[0]) <=
+            NORMAL_STOP_FINISH_SPEED_RAD_S &&
+          std::abs(hw_velocities_[1]) <=
+            NORMAL_STOP_FINISH_SPEED_RAD_S)
+      {
+        normal_stop_ramp_active_ = false;
+        zero_stop_hold_ = true;
+
+        normal_stop_ref_left_ = 0.0;
+        normal_stop_ref_right_ = 0.0;
+
+        control_ref_l = 0.0;
+        control_ref_r = 0.0;
+
+        RCLCPP_INFO(
+          rclcpp::get_logger("Zlac8015dSystemHardware"),
+          "Normal stop completed -> ZERO HOLD: vel=[%.3f, %.3f] rad/s.",
+          hw_velocities_[0],
+          hw_velocities_[1]);
+      }
+    }
+  }
+  else {
+
+    // New non-zero motion command releases ZERO HOLD.
+    normal_stop_ramp_active_ = false;
+    zero_stop_hold_ = false;
+
+    normal_stop_ref_left_ = hw_commands_[0];
+    normal_stop_ref_right_ = hw_commands_[1];
+
+    control_ref_l = hw_commands_[0];
+    control_ref_r = hw_commands_[1];
+  }
+
   // LESO input: previous-cycle commanded current.
   // This defines the LADRC plant input as the current command sent
   // to the motor driver. Current-loop dynamics and command/actual
@@ -567,16 +826,104 @@ hardware_interface::return_type Zlac8015dSystemHardware::write(
   constexpr double INPLACE_SUM_TOL_RAD_S = 0.05;
 
   const bool coordinated_turn =
-    (hw_commands_[0] * hw_commands_[1] < 0.0) &&
-    (std::abs(hw_commands_[0] + hw_commands_[1]) <=
+    (control_ref_l * control_ref_r < 0.0) &&
+    (std::abs(control_ref_l + control_ref_r) <=
      INPLACE_SUM_TOL_RAD_S);
 
   const bool allow_independent_track =
     !coordinated_turn;
 
+  // ==========================================================
+  // Straight-line wheel synchronization
+  //
+  // e_sync = omega_R - omega_L
+  //
+  // ref_L* = ref_L + Ksync * e_sync
+  // ref_R* = ref_R - Ksync * e_sync
+  //
+  // Apply only after both wheels are already in TRACK and
+  // TRACK_HOLD has completed.  Do not apply during turns,
+  // normal stopping, ZERO HOLD, or BREAKAWAY.
+  // ==========================================================
+  constexpr double SYNC_REF_DIFF_TOL_RAD_S = 0.05;
+  constexpr double SYNC_GAIN_MAX = 0.10;
+
+  // 200 Hz:
+  //   first 0.5 s after eligibility : Ksync = 0
+  //   next  0.5 s                   : ramp 0 -> 0.10
+  constexpr int SYNC_DELAY_SAMPLES = 100;
+  constexpr int SYNC_RAMP_SAMPLES  = 100;
+
+  static int sync_track_count = 0;
+
+  const bool straight_command =
+    (control_ref_l * control_ref_r > 0.0) &&
+    (std::abs(control_ref_l - control_ref_r) <=
+     SYNC_REF_DIFF_TOL_RAD_S);
+
+  const bool sync_eligible =
+    straight_command &&
+    !normal_stop_ramp_active_ &&
+    !zero_stop_hold_ &&
+    left_ladrc_.tracking &&
+    right_ladrc_.tracking &&
+    left_ladrc_.track_hold_count >= 30 &&
+    right_ladrc_.track_hold_count >= 30;
+
+  double ladrc_ref_l = control_ref_l;
+  double ladrc_ref_r = control_ref_r;
+
+  constexpr double SYNC_ERROR_MAX_RAD_S = 0.60;
+
+  const double sync_error =
+    hw_velocities_[1] - hw_velocities_[0];
+
+  const bool sync_error_in_range =
+    std::abs(sync_error) <= SYNC_ERROR_MAX_RAD_S;
+
+  if (sync_eligible)
+  {
+    if (sync_error_in_range)
+    {
+      ++sync_track_count;
+
+      double sync_gain = 0.0;
+
+      if (sync_track_count > SYNC_DELAY_SAMPLES)
+      {
+        const int ramp_count =
+          sync_track_count - SYNC_DELAY_SAMPLES;
+
+        const double ramp_ratio =
+          clamp(
+            static_cast<double>(ramp_count) /
+            static_cast<double>(SYNC_RAMP_SAMPLES),
+            0.0,
+            1.0);
+
+        sync_gain =
+          SYNC_GAIN_MAX * ramp_ratio;
+      }
+
+      ladrc_ref_l +=
+        sync_gain * sync_error;
+
+      ladrc_ref_r -=
+        sync_gain * sync_error;
+    }
+    // If |sync_error| > 0.60 rad/s:
+    // suspend synchronization, but preserve sync_track_count.
+  }
+  else
+  {
+    // Reset only when straight-line synchronization itself
+    // is no longer eligible.
+    sync_track_count = 0;
+  }
+
   double cmd_current_l = compute_ladrc_current(
     left_ladrc_,
-    hw_commands_[0],
+    ladrc_ref_l,
     hw_velocities_[0],
     current_l_measured,
     dt,
@@ -584,14 +931,14 @@ hardware_interface::return_type Zlac8015dSystemHardware::write(
 
   double cmd_current_r = compute_ladrc_current(
     right_ladrc_,
-    hw_commands_[1],
+    ladrc_ref_r,
     hw_velocities_[1],
     current_r_measured,
     dt,
     allow_independent_track);
 
   // 0.30 rad/s for 100 ms = 20 samples @ 200 Hz.
-  constexpr int COORDINATED_START_SAMPLES = 20;
+  constexpr int COORDINATED_START_SAMPLES = 5;
   constexpr double COORDINATED_BREAKAWAY_START_A = 0.65;
 
   // ----------------------------------------------------------
@@ -621,11 +968,31 @@ hardware_interface::return_type Zlac8015dSystemHardware::write(
     left_ladrc_.z1 = hw_velocities_[0];
     right_ladrc_.z1 = hw_velocities_[1];
 
-    left_ladrc_.z2 = 0.0;
-    right_ladrc_.z2 = 0.0;
+    const int direction_l =
+      control_ref_l >= 0.0 ? +1 : -1;
 
-    left_ladrc_.initialized = true;
-    right_ladrc_.initialized = true;
+    const int direction_r =
+      control_ref_r >= 0.0 ? +1 : -1;
+
+    const double breakaway_current_l =
+      static_cast<double>(direction_l) *
+      left_ladrc_.track_hold_start;
+
+    const double breakaway_current_r =
+      static_cast<double>(direction_r) *
+      right_ladrc_.track_hold_start;
+
+    constexpr double TRACK_Z2_INIT_RATIO = 0.50;
+
+    left_ladrc_.z2 =
+      -TRACK_Z2_INIT_RATIO *
+      left_ladrc_.b0 *
+      breakaway_current_l;
+
+    right_ladrc_.z2 =
+      -TRACK_Z2_INIT_RATIO *
+      right_ladrc_.b0 *
+      breakaway_current_r;
   }
 
   // ----------------------------------------------------------
@@ -663,10 +1030,10 @@ hardware_interface::return_type Zlac8015dSystemHardware::write(
       };
 
     const int direction_l =
-      hw_commands_[0] >= 0.0 ? +1 : -1;
+      control_ref_l >= 0.0 ? +1 : -1;
 
     const int direction_r =
-      hw_commands_[1] >= 0.0 ? +1 : -1;
+      control_ref_r >= 0.0 ? +1 : -1;
 
     reset_to_breakaway(
       left_ladrc_, hw_velocities_[0], direction_l);
@@ -701,72 +1068,9 @@ hardware_interface::return_type Zlac8015dSystemHardware::write(
     return hardware_interface::return_type::ERROR;
   }
 
-  // ==========================================================
-  // 200 Hz LADRC runtime CSV logger
-  // ==========================================================
-  static std::ofstream csv_log;
-  static bool csv_initialized = false;
-  static std::chrono::steady_clock::time_point csv_start_time;
-  static int csv_flush_count = 0;
-
-  if (!csv_initialized) {
-    csv_log.open(
-      "/tmp/ladrc_track_200hz.csv",
-      std::ios::out | std::ios::trunc);
-
-    if (csv_log.is_open()) {
-      csv_log
-        << "time_s,"
-        << "ref_left_rad_s,ref_right_rad_s,"
-        << "vel_left_rad_s,vel_right_rad_s,"
-        << "pos_left_rad,pos_right_rad,"
-        << "cmd_current_left_A,cmd_current_right_A,"
-        << "actual_current_left_A,actual_current_right_A,"
-        << "z1_left,z1_right,"
-        << "z2_left,z2_right,"
-        << "tracking_left,tracking_right,"
-        << "breakaway_target_left_A,breakaway_target_right_A"
-        << '\n';
-
-      csv_log << std::setprecision(10);
-      csv_start_time = std::chrono::steady_clock::now();
-    }
-
-    csv_initialized = true;
-  }
-
-  if (csv_log.is_open()) {
-    const double csv_time_s =
-      std::chrono::duration<double>(
-        std::chrono::steady_clock::now() -
-        csv_start_time).count();
-
-    csv_log
-      << csv_time_s << ","
-      << hw_commands_[0] << ","
-      << hw_commands_[1] << ","
-      << hw_velocities_[0] << ","
-      << hw_velocities_[1] << ","
-      << hw_positions_[0] << ","
-      << hw_positions_[1] << ","
-      << cmd_current_l << ","
-      << cmd_current_r << ","
-      << current_l_measured << ","
-      << current_r_measured << ","
-      << left_ladrc_.z1 << ","
-      << right_ladrc_.z1 << ","
-      << left_ladrc_.z2 << ","
-      << right_ladrc_.z2 << ","
-      << static_cast<int>(left_ladrc_.tracking) << ","
-      << static_cast<int>(right_ladrc_.tracking) << ","
-      << left_ladrc_.breakaway_target << ","
-      << right_ladrc_.breakaway_target
-      << '\n';
-
-    if (++csv_flush_count % 200 == 0) {
-      csv_log.flush();
-    }
-  }
+  log_ladrc_runtime(
+    cmd_current_l,
+    cmd_current_r);
 
   static int debug_count = 0;
   if (++debug_count % 200 == 0) {
@@ -818,29 +1122,33 @@ double Zlac8015dSystemHardware::compute_ladrc_current(
   constexpr double REF_ZERO = 1.0e-6;
 
   constexpr double BREAKAWAY_START_A = 0.65;
-  constexpr double BREAKAWAY_STEP_A  = 0.10;
+  constexpr double BREAKAWAY_STEP_A = 0.15;
   constexpr double BREAKAWAY_MAX_A   = 8.00;
 
   // During coordinated in-place BREAKAWAY, a wheel that has
   // already satisfied the start condition waits at this current
   // while the other wheel continues its BREAKAWAY ramp.
-  constexpr double READY_WAIT_A      = 1.00;
+  constexpr double READY_WAIT_A = 2.00;
 
-  constexpr int BREAKAWAY_STEP_SAMPLES = 40;  // 200 ms @ 200 Hz
+  constexpr int BREAKAWAY_STEP_SAMPLES = 10;  // 200 ms @ 200 Hz
 
   constexpr double START_SPEED_RAD_S = 0.30;
-  constexpr int START_SAMPLES = 20;            // 100 ms @ 200 Hz
+  constexpr int START_SAMPLES = 20;
+constexpr int COORDINATED_READY_SAMPLES = 5;            // 100 ms @ 200 Hz
 
   constexpr double STALL_SPEED_RAD_S = 0.10;
   constexpr int STALL_SAMPLES = 20;            // 100 ms @ 200 Hz
 
-  constexpr int TRACK_HOLD_SAMPLES = 60;       // 300 ms @ 200 Hz
+  constexpr int TRACK_HOLD_SAMPLES = 30;       // 300 ms @ 200 Hz
   constexpr double TRACK_FLOOR_A = 0.20;
 
 
   // ----------------------------------------------------------
   // Zero velocity reference:
-  // stop current and reset the state machine.
+  // reset LADRC state and command zero current.
+  //
+  // Actual stopping is handled by the driver-side Quick Stop
+  // in write().
   // ----------------------------------------------------------
 
   if (std::abs(velocity_reference) <= REF_ZERO) {
@@ -925,21 +1233,21 @@ double Zlac8015dSystemHardware::compute_ladrc_current(
     // start_count resets and the current ramp resumes.
     const bool coordinated_ready =
       (!allow_track_transition &&
-       state.start_count >= START_SAMPLES);
+       state.start_count >= COORDINATED_READY_SAMPLES);
 
-    // A wheel that becomes READY must not keep the large
-    // BREAKAWAY current that was required to overcome static
-    // friction. Reduce it immediately to the waiting current.
-    //
-    // If the wheel subsequently falls below START_SPEED_RAD_S,
-    // start_count resets to zero and the BREAKAWAY ramp resumes
-    // from READY_WAIT_A.
+    // During coordinated READY, use READY_WAIT_A as a minimum current.
+    // If a larger current was required to reach READY, keep that value.
     if (coordinated_ready) {
       state.breakaway_target =
-        std::min(state.breakaway_target, READY_WAIT_A);
+        std::max(state.breakaway_target, READY_WAIT_A);
     }
 
-    // Increase target by 0.05 A every 200 ms only while
+    // Once a wheel becomes READY, stop increasing its BREAKAWAY
+    // current and keep at least READY_WAIT_A.
+    // If the wheel required more than READY_WAIT_A to become READY,
+    // keep that larger value.
+
+    // Increase target by BREAKAWAY_STEP_A every 200 ms only while
     // this wheel is not yet ready.
     if (!coordinated_ready &&
         state.breakaway_count > 0 &&
@@ -1017,13 +1325,44 @@ double Zlac8015dSystemHardware::compute_ladrc_current(
   // TRACK: LADRC
   // ==========================================================
 
+  // Normal tracking uses the original LADRC feedback term.
+  //
+  // During the normal-stop ramp, add the commanded wheel angular
+  // deceleration directly as acceleration feedforward.
+  //
+  // a_vehicle = 1.0 m/s^2
+  // wheel radius = 0.064 m
+  // -> |omega_dot| = 1.0 / 0.064 = 15.625 rad/s^2
+  constexpr double NORMAL_STOP_ANG_DECEL_RAD_S2 = 15.625;
+
+  double acceleration_feedforward = 0.0;
+
+  if (normal_stop_ramp_active_ &&
+      std::abs(velocity_reference) > 1.0e-6)
+  {
+    acceleration_feedforward =
+      -std::copysign(
+        NORMAL_STOP_ANG_DECEL_RAD_S2,
+        velocity_reference);
+  }
+
   const double desired_acceleration =
+    acceleration_feedforward +
     controller_bandwidth_ *
     (velocity_reference - state.z1);
 
-  double current_command =
+  // Raw LADRC current request before Imax, slew-rate and
+  // TRACK current-floor processing.
+  //
+  // Its sign is important: if LADRC requests current opposite
+  // to the commanded motion, the controller is asking for
+  // braking torque.  TRACK current floor must not prevent that.
+  const double raw_ladrc_current_command =
     (desired_acceleration - state.z2) /
     state.b0;
+
+  double current_command =
+    raw_ladrc_current_command;
 
 
   // TRACK Imax
@@ -1066,8 +1405,36 @@ double Zlac8015dSystemHardware::compute_ladrc_current(
 
   // During forward/reverse tracking, keep at least the floor
   // current in the commanded direction.
-  if (static_cast<double>(direction) *
-      current_command < floor_a)
+  // The tracking current floor is useful during normal driving,
+  // but it must NOT be applied during controlled deceleration.
+  //
+  // Otherwise a negative braking-current command during forward
+  // motion would be overwritten by a positive floor current.
+  // Apply the TRACK current floor only when the LADRC command
+  // is in the same direction as the commanded wheel motion.
+  //
+  // If LADRC requests reverse-sign current, the wheel is typically
+  // overspeeding and the controller is asking for braking torque.
+  // In that case, do NOT overwrite the braking command with the
+  // positive/forward current floor.
+  const double raw_current_in_command_direction =
+    static_cast<double>(direction) *
+    raw_ladrc_current_command;
+
+  const double current_in_command_direction =
+    static_cast<double>(direction) *
+    current_command;
+
+  // Apply the TRACK current floor only when the ORIGINAL LADRC
+  // request is drive torque in the commanded direction.
+  //
+  // If raw LADRC requests braking torque, do not apply the floor.
+  // The slew-rate limiter can then move the command gradually
+  // through zero into braking current.
+  if (!normal_stop_ramp_active_ &&
+      raw_current_in_command_direction >= 0.0 &&
+      current_in_command_direction >= 0.0 &&
+      current_in_command_direction < floor_a)
   {
     current_command =
       static_cast<double>(direction) *
