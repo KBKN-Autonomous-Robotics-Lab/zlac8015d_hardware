@@ -20,55 +20,27 @@ endif()
 add_library(zlac8015d_hardware SHARED
   src/zlac8015d_system.cpp
 )
-target_include_directories(zlac8015d_hardware PRIVATE include)
-target_compile_features(zlac8015d_hardware PUBLIC cxx_std_17)
-ament_target_dependencies(zlac8015d_hardware
+
+target_include_directories(
+  zlac8015d_hardware
+  PRIVATE include
+)
+
+target_compile_features(
+  zlac8015d_hardware
+  PUBLIC cxx_std_17
+)
+
+ament_target_dependencies(
+  zlac8015d_hardware
   rclcpp
   hardware_interface
   pluginlib
 )
 
-# Standalone SocketCAN data-acquisition utility for LADRC b0 identification.
-# It intentionally does not run through ros2_control, so no controller can
-# overwrite the test-current command during the identification experiment.
-add_executable(b0_identification
-  src/b0_identification.cpp
-)
-target_compile_features(b0_identification PUBLIC cxx_std_17)
-
-add_executable(b0_identification_moving
-  src/b0_identification_moving.cpp
-)
-target_compile_features(b0_identification_moving PUBLIC cxx_std_17)
-
-
-# Standalone LADRC step-response validation tool. It talks directly to
-# SocketCAN so ros2_control cannot overwrite the test current.
-add_executable(ladrc_step_response
-  src/ladrc_step_response.cpp
-)
-target_compile_features(ladrc_step_response PUBLIC cxx_std_17)
-
-pluginlib_export_plugin_description_file(hardware_interface zlac8015d_hardware.xml)
-
-add_executable(
-  breakaway_current_identification
-  src/breakaway_current_identification.cpp
-)
-
-target_compile_features(
-  breakaway_current_identification
-  PUBLIC cxx_std_17
-)
-
-add_executable(
-  ground_startability_test
-  src/ground_startability_test.cpp
-)
-
-target_compile_features(
-  ground_startability_test
-  PUBLIC cxx_std_17
+pluginlib_export_plugin_description_file(
+  hardware_interface
+  zlac8015d_hardware.xml
 )
 
 install(
@@ -77,31 +49,38 @@ install(
 )
 
 install(
-  TARGETS
-    b0_identification
-    b0_identification_moving
-    ladrc_step_response
-  DESTINATION lib/${PROJECT_NAME}
+  DIRECTORY include/
+  DESTINATION include
 )
 
+
+
+# Standalone SocketCAN step-response acquisition for first-order plant identification.
+add_executable(first_order_identification
+  src/first_order_identification.cpp
+)
+target_compile_features(first_order_identification PUBLIC cxx_std_17)
+
 install(
-  TARGETS
-    ladrc_step_response
-    breakaway_current_identification
-    ground_startability_test
+  TARGETS first_order_identification
   DESTINATION lib/${PROJECT_NAME}
 )
 
 install(
   PROGRAMS
-    scripts/analyze_b0.py
-    scripts/analyze_ladrc_step.py
+    scripts/analyze_first_order.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
-install(
-  DIRECTORY include/
-  DESTINATION include
+ament_package()
+
+
+# Running-wheel current switching experiment
+add_executable(running_step_identification
+  src/running_step_identification.cpp
 )
 
-ament_package()
+install(TARGETS
+  running_step_identification
+  DESTINATION lib/${PROJECT_NAME}
+)

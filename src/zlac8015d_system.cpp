@@ -131,7 +131,7 @@ hardware_interface::CallbackReturn Zlac8015dSystemHardware::on_init(
     right_ladrc_.b0 = get_double_parameter(info_, "ladrc_b0_right", 1.0);
     controller_bandwidth_ = get_double_parameter(info_, "ladrc_wc", 5.0);
     observer_bandwidth_ = get_double_parameter(info_, "ladrc_wo", 20.0);
-    current_limit_a_ = get_double_parameter(info_, "current_limit_a", 2.0);
+    current_limit_a_ = get_double_parameter(info_, "current_limit_a", 8.0);
     current_rate_limit_a_per_s_ =
       get_double_parameter(info_, "current_rate_limit_a_per_s", 20.0);
     feedback_timeout_s_ =
@@ -873,7 +873,7 @@ hardware_interface::return_type Zlac8015dSystemHardware::write(
   double ladrc_ref_l = control_ref_l;
   double ladrc_ref_r = control_ref_r;
 
-  constexpr double SYNC_ERROR_MAX_RAD_S = 0.60;
+  constexpr double SYNC_ERROR_MAX_RAD_S = 0.3;
 
   const double sync_error =
     hw_velocities_[1] - hw_velocities_[0];
@@ -1095,40 +1095,17 @@ double Zlac8015dSystemHardware::compute_ladrc_current(
   const double dt,
   const bool allow_track_transition)
 {
-  // ==========================================================
-  // Tuned normal-ground LADRC
-  //
-  // b0   = supplied by URDF (20)
-  // wc   = 5 rad/s
-  // wo   = 20 rad/s
-  // Imax = 0.7 A
-  //
-  // BREAKAWAY:
-  //   0.65 A start
-  //   +0.05 A every 200 ms
-  //   max 1.0 A
-  //
-  // BREAKAWAY -> TRACK:
-  //   |omega| >= 0.30 rad/s for 100 ms
-  //
-  // TRACK -> BREAKAWAY:
-  //   |omega| < 0.10 rad/s for 100 ms
-  //
-  // TRACK_HOLD:
-  //   300 ms
-  //   previous BREAKAWAY current -> 0.20 A
-  // ==========================================================
 
   constexpr double REF_ZERO = 1.0e-6;
 
   constexpr double BREAKAWAY_START_A = 0.65;
-  constexpr double BREAKAWAY_STEP_A = 0.15;
+  constexpr double BREAKAWAY_STEP_A = 0.50;
   constexpr double BREAKAWAY_MAX_A   = 8.00;
 
   // During coordinated in-place BREAKAWAY, a wheel that has
   // already satisfied the start condition waits at this current
   // while the other wheel continues its BREAKAWAY ramp.
-  constexpr double READY_WAIT_A = 2.00;
+  constexpr double READY_WAIT_A = 3.00;
 
   constexpr int BREAKAWAY_STEP_SAMPLES = 10;  // 200 ms @ 200 Hz
 
