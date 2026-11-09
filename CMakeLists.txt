@@ -53,34 +53,3 @@ install(
   DESTINATION include
 )
 
-
-
-# Standalone SocketCAN step-response acquisition for first-order plant identification.
-add_executable(first_order_identification
-  src/first_order_identification.cpp
-)
-target_compile_features(first_order_identification PUBLIC cxx_std_17)
-
-install(
-  TARGETS first_order_identification
-  DESTINATION lib/${PROJECT_NAME}
-)
-
-install(
-  PROGRAMS
-    scripts/analyze_first_order.py
-  DESTINATION lib/${PROJECT_NAME}
-)
-
-ament_package()
-
-
-# Running-wheel current switching experiment
-add_executable(running_step_identification
-  src/running_step_identification.cpp
-)
-
-install(TARGETS
-  running_step_identification
-  DESTINATION lib/${PROJECT_NAME}
-)
