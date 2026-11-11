@@ -102,8 +102,8 @@ private:
   LadrcState left_ladrc_;
   LadrcState right_ladrc_;
   double controller_bandwidth_{5.0};       // wc [rad/s]
-  double observer_bandwidth_{20.0};        // wo [rad/s]
-  double current_limit_a_{2.0};            // absolute LADRC output limit [A]
+  double observer_bandwidth_{18.0};        // wo [rad/s]
+  double current_limit_a_{6.0};            // absolute LADRC output limit [A]
   double current_rate_limit_a_per_s_{20.0};
   double feedback_timeout_s_{0.030};
 
